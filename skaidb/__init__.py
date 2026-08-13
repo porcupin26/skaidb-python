@@ -285,12 +285,16 @@ _OP_PREPARE = 2
 _OP_EXECUTE = 3
 _OP_CLOSE = 4
 _OP_EXECUTE_BATCH = 7
+_OP_QUERY_STREAM = 5
 
 _RESP_ROWS = 0
 _RESP_MUTATION = 1
 _RESP_DDL = 2
 _RESP_ERROR = 3
 _RESP_PREPARED = 4
+_RESP_ROWS_HEADER = 5
+_RESP_ROWS_CHUNK = 6
+_RESP_ROWS_END = 7
 
 # Keep the per-connection prepared-statement cache under the server's
 # MAX_PREPARED_PER_CONN (256): statements beyond this are prepared, executed,
@@ -694,6 +698,50 @@ class Connection:
             self._roundtrip(req)
         except (OperationalError, ProgrammingError, InterfaceError):
             pass
+
+    def stream(self, sql: str, consistency: "int | None" = None):
+        """Yield rows one at a time, holding one chunk instead of the whole
+        result — for exports and large scans.
+
+        Uses `OP_QUERY_STREAM`: the server sends a header, then chunks, then
+        an end frame. The connection is busy for the whole stream, so do not
+        run other statements on it until the generator is exhausted (or
+        closed, which drains the rest).
+
+        Takes no parameters: the streaming opcode carries SQL text. Raises
+        `NotSupportedError` against a server that does not know the opcode.
+        """
+        level = self._consistency if consistency is None else consistency
+        body = sql.encode("utf-8")
+        req = bytes([_OP_QUERY_STREAM, level]) + struct.pack("<I", len(body)) + body
+        r = self._roundtrip(req)
+        tag = r.u8()
+        if tag == _RESP_ERROR:
+            msg = r.text()
+            if "unknown opcode" in msg:
+                raise ProgrammingError(f"server does not support streaming: {msg}")
+            raise ProgrammingError(msg)
+        if tag in (_RESP_MUTATION, _RESP_DDL):
+            return  # not a row-producing statement: nothing to yield
+        if tag != _RESP_ROWS_HEADER:
+            raise InterfaceError(f"unexpected response tag {tag} to stream request")
+        columns = [r.text() for _ in range(r.u32())]
+        self._stream_columns = columns
+        while True:
+            fr = _Reader(self._read_frame())
+            t = fr.u8()
+            if t == _RESP_ROWS_CHUNK:
+                for _ in range(fr.u32()):
+                    yield tuple(
+                        _decode_value(_Reader(fr.blob())) for _ in range(fr.u32())
+                    )
+            elif t == _RESP_ROWS_END:
+                return
+            elif t == _RESP_ERROR:
+                # Rows already yielded are valid; the statement failed partway.
+                raise ProgrammingError(fr.text())
+            else:
+                raise InterfaceError(f"unexpected frame tag {t} in stream")
 
     def _execute_params(self, sql: str, params: Sequence[Any], consistency: int):
         """Run `sql` with `params` bound as typed values over the prepared
