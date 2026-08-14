@@ -709,7 +709,7 @@ class Connection:
         closed, which drains the rest).
 
         Takes no parameters: the streaming opcode carries SQL text. Raises
-        `NotSupportedError` against a server that does not know the opcode.
+        `ProgrammingError` against a server that does not know the opcode.
         """
         level = self._consistency if consistency is None else consistency
         body = sql.encode("utf-8")
