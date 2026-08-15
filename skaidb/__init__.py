@@ -763,6 +763,45 @@ class Connection:
                 self._close_prepared(stmt_id)
 
     # -- DB-API surface --
+    def subscribe(self, stream: str, after: "str | None" = None, poll: float = 0.5):
+        """Yield a stream's events as they arrive, forever.
+
+        A thin, dependency-free helper over the stream's log: it pages the
+        log with the keyset cursor and yields each event as a dict
+        (``id``, ``op``, ``k``, ``ts``, ``doc``). ``id`` is the position —
+        keep the last one you processed and pass it as ``after`` to resume
+        exactly where you stopped, across restarts.
+
+        This polls rather than pushing, which is why it needs no MQTT
+        client. For push delivery subscribe to ``$stream/<db>/<name>`` with
+        any MQTT client instead; the events are identical.
+
+            for ev in conn.subscribe("big_orders"):
+                handle(ev["doc"])
+        """
+        import time as _time
+
+        log = "_stream_" + stream
+        cur = after
+        while True:
+            if cur is None:
+                sql = f"SELECT id, op, k, ts, doc FROM {log} ORDER BY id LIMIT 500"
+                params: tuple = ()
+            else:
+                sql = (
+                    f"SELECT id, op, k, ts, doc FROM {log} "
+                    "WHERE id > ? ORDER BY id LIMIT 500"
+                )
+                params = (cur,)
+            cursor = self.cursor()
+            cursor.execute(sql, params)
+            batch = cursor.fetchall()
+            for row in batch:
+                cur = row[0]
+                yield {"id": row[0], "op": row[1], "k": row[2], "ts": row[3], "doc": row[4]}
+            if not batch:
+                _time.sleep(poll)
+
     def cursor(self) -> "Cursor":
         if self.closed:
             raise ProgrammingError("connection is closed")
