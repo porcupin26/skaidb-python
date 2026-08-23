@@ -21,6 +21,10 @@ learn. Placeholders use the ``qmark`` style (``?``), exactly like ``sqlite3``.
 
 from __future__ import annotations
 
+# Reported in the server's `drivers` table via Hello; keep in sync with
+# pyproject.toml.
+__version__ = "0.1.0"
+
 import datetime as _dt
 import decimal
 import hashlib
@@ -286,6 +290,7 @@ _OP_EXECUTE = 3
 _OP_CLOSE = 4
 _OP_EXECUTE_BATCH = 7
 _OP_QUERY_STREAM = 5
+_OP_HELLO = 8
 
 _RESP_ROWS = 0
 _RESP_MUTATION = 1
@@ -495,6 +500,7 @@ class Connection:
             # statements and is not broken.
             self._broken = False
             self._prepared.clear()
+            self._send_hello()
             if self._database is not None:
                 self._use_database(self._database)
             return
@@ -509,6 +515,22 @@ class Connection:
                 pass
         self._file = None
         self._sock = None
+
+    def _send_hello(self) -> None:
+        """Best-effort self-identification (fills the server's ``drivers``
+        table ``client_name``/``client_version``). An old server rejects the
+        opcode with an error frame, which is ignored — identity is
+        telemetry, never load-bearing."""
+        try:
+            name = b"python"
+            ver = __version__.encode()
+            req = bytearray([_OP_HELLO])
+            req += struct.pack("<I", len(name)) + name
+            req += struct.pack("<I", len(ver)) + ver
+            self._write_frame(bytes(req))
+            self._read_frame()  # Ddl ack, or an old server's Error — either way, done.
+        except (OSError, OperationalError):
+            pass
 
     def _use_database(self, db: str) -> None:
         ident = '"' + db.replace('"', '""') + '"'
