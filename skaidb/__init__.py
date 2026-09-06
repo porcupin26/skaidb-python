@@ -300,6 +300,7 @@ _RESP_PREPARED = 4
 _RESP_ROWS_HEADER = 5
 _RESP_ROWS_CHUNK = 6
 _RESP_ROWS_END = 7
+_RESP_RESULT_SETS = 8
 
 # Keep the per-connection prepared-statement cache under the server's
 # MAX_PREPARED_PER_CONN (256): statements beyond this are prepared, executed,
@@ -624,6 +625,19 @@ class Connection:
                 row = tuple(_decode_value(_Reader(r.blob())) for _ in range(ncells))
                 rows.append(row)
             return ("rows", columns, rows)
+        if tag == _RESP_RESULT_SETS:
+            # Several result sets (a CALL whose body EMITs): DB-API style —
+            # the first set is current, `Cursor.nextset()` walks the rest.
+            sets = []
+            for _ in range(r.u32()):
+                ncols = r.u32()
+                columns = [r.text() for _ in range(ncols)]
+                rows = []
+                for _ in range(r.u32()):
+                    ncells = r.u32()
+                    rows.append(tuple(_decode_value(_Reader(r.blob())) for _ in range(ncells)))
+                sets.append((columns, rows))
+            return ("sets", sets, None)
         if tag == _RESP_MUTATION:
             return ("mutation", r.u64(), None)
         if tag == _RESP_DDL:
@@ -868,6 +882,9 @@ class Cursor:
         self.rowcount = -1
         self.description = None
         self._rows: list = []
+        # Every result set of the last CALL that EMITted several (DB-API
+        # `nextset()` walks them; the first is current after execute()).
+        self._result_sets: list = []
         self._pos = 0
         self._consistency = connection._consistency
 
@@ -889,6 +906,12 @@ class Cursor:
             kind, a, b = self.connection._query(
                 _bind(sql, None), self._consistency
             )
+        self._result_sets = []
+        if kind == "sets":
+            self._result_sets = list(a)
+            columns, rows = self._result_sets[0] if self._result_sets else ([], [])
+            kind = "rows"
+            a, b = columns, rows
         if kind == "rows":
             columns, rows = a, b
             # description: 7-tuples per DB-API; only name is meaningful here
@@ -963,6 +986,21 @@ class Cursor:
         chunk = self._rows[self._pos:]
         self._pos = len(self._rows)
         return chunk
+
+    def nextset(self):
+        """Advance to the next result set of a multi-set reply (a `CALL`
+        whose body `EMIT`ted result sets). Returns True when another set is
+        now current, None when there is none (DB-API)."""
+        if len(self._result_sets) <= 1:
+            self._result_sets = []
+            return None
+        self._result_sets.pop(0)
+        columns, rows = self._result_sets[0]
+        self.description = [(c, None, None, None, None, None, None) for c in columns]
+        self._rows = rows
+        self.rowcount = len(rows)
+        self._pos = 0
+        return True
 
     def __iter__(self):
         return self
