@@ -44,6 +44,7 @@ __all__ = [
     "ConnectionPool",
     "pool",
     "Cursor",
+    "RowStream",
     "Error",
     "DatabaseError",
     "OperationalError",
@@ -307,6 +308,18 @@ _RESP_RESULT_SETS = 8
 # and immediately closed rather than retained.
 _MAX_PREPARED_CACHE = 240
 
+# Frames an abandoned stream will read and discard before giving up and
+# marking the connection broken. Draining is much cheaper than a reconnect
+# for the tail of a small result; past this the remainder is big enough that
+# discarding the connection is the better trade (PROTOCOL.md §3: a client
+# that abandons a stream early must drain or close).
+_STREAM_DRAIN_MAX_FRAMES = 64
+
+_BUSY_STREAMING = (
+    "connection is busy streaming; finish or close() the RowStream "
+    "(or use a second connection) before running another statement"
+)
+
 
 class _Unpreparable(Exception):
     """Internal: the server reported a statement kind that cannot be prepared
@@ -432,11 +445,17 @@ class Connection:
     """A DB-API 2.0 connection to one skaidb node.
 
     skaidb is non-transactional (each statement commits on its own), so
-    ``commit()`` and ``rollback()`` are accepted no-ops for DB-API conformance.
+    ``commit()`` is an accepted no-op for DB-API conformance; ``rollback()``
+    raises, since silently dropping a rollback would be worse than refusing
+    it. Use ``BEGIN``/``COMMIT``/``ROLLBACK`` as statements instead.
     """
 
     _nonce_counter = 0
     _nonce_lock = threading.Lock()
+    # Class-level defaults: health state must have an answer even on an
+    # instance built without __init__ (a subclass wiring its own transport).
+    _broken = False
+    _streaming = False
 
     def __init__(
         self,
@@ -453,9 +472,18 @@ class Connection:
         self._consistency = Consistency.resolve(consistency)
         self._lock = threading.Lock()
         self.closed = False
-        # Set once a transport error leaves the socket out of sync; a pool
-        # checks `is_usable()` and discards the connection instead of reusing it.
+        # Set once a transport error, or an abandoned stream too long to
+        # drain, leaves the socket out of sync; a pool checks `is_usable()`
+        # and discards the connection instead of reusing it.
         self._broken = False
+        # True while a `RowStream` owns the socket. The stream spans many
+        # frames and many `next()` calls, so holding `_lock` for its duration
+        # would deadlock the common single-threaded shape (a statement run
+        # from inside the `for` loop) and would block, not warn, in the
+        # threaded one. A flag instead lets any other statement fail loudly
+        # with a clear message — PROTOCOL.md §3: no other request may be sent
+        # until RowsEnd or Error.
+        self._streaming = False
         # sql text -> (prepared_id, nparams) for this connection. Ids are
         # per-connection slot indices assigned by the server, so the cache is
         # cleared whenever the underlying socket is (re)dialed.
@@ -498,8 +526,9 @@ class Connection:
                 self._drop_socket()
                 continue
             # Connected + authenticated: a fresh socket has no prepared
-            # statements and is not broken.
+            # statements, no stream in flight and is not broken.
             self._broken = False
+            self._streaming = False
             self._prepared.clear()
             self._send_hello()
             if self._database is not None:
@@ -547,9 +576,15 @@ class Connection:
         self._open()
 
     def is_usable(self) -> bool:
-        """True if the connection can still be used — not closed and not left
-        out of sync by a mid-query transport error. Cheap (no round-trip)."""
-        return not self.closed and not self._broken
+        """True if the connection can be handed to a new caller — not closed,
+        not left out of sync by a transport error or an undrainable abandoned
+        stream, and not currently mid-stream. Cheap (no round-trip).
+
+        The mid-stream case matters because this doubles as a pool's health
+        check: a connection returned to the pool while a `RowStream` is still
+        live has chunks in flight, and the next caller would read them as the
+        answer to its own statement."""
+        return not self.closed and not self._broken and not self._streaming
 
     def ping(self) -> bool:
         """Round-trip liveness check; returns False (and marks the connection
@@ -564,6 +599,8 @@ class Connection:
 
     # -- framing --
     def _write_frame(self, payload: bytes) -> None:
+        if self._sock is None:
+            raise OperationalError("connection is not open")
         self._sock.sendall(struct.pack(">I", len(payload)) + payload)
 
     def _read_frame(self) -> bytes:
@@ -572,6 +609,10 @@ class Connection:
         return self._read_exact(length)
 
     def _read_exact(self, n: int) -> bytes:
+        # `close()` can drop the socket while a stream still holds a
+        # reference to this connection, so the file may be gone.
+        if self._file is None:
+            raise OperationalError("connection is not open")
         buf = self._file.read(n)
         if buf is None or len(buf) != n:
             raise OperationalError("connection closed by server")
@@ -650,10 +691,14 @@ class Connection:
         """Send one request frame and read one response frame under the
         connection lock. Transport failures surface as `OperationalError` so a
         pool can recycle the connection cleanly."""
-        if self.closed:
-            raise ProgrammingError("connection is closed")
+        self._check_ready()
         try:
             with self._lock:
+                # Re-check under the lock: `_stream_open` claims the
+                # connection while holding it, so this is where a statement
+                # racing a stream on another thread is ordered.
+                if self._streaming:
+                    raise ProgrammingError(_BUSY_STREAMING)
                 self._write_frame(req)
                 return _Reader(self._read_frame())
         except OperationalError:
@@ -664,6 +709,21 @@ class Connection:
         except OSError as e:  # mid-query socket error: dead peer, timeout, ...
             self._broken = True
             raise OperationalError(f"query transport failed: {e}") from e
+
+    def _check_ready(self) -> None:
+        """Refuse to start a request on a connection that cannot carry one.
+        A broken connection is refused rather than retried because its socket
+        may hold unread frames: writing into it would read someone else's
+        answer back, which is far more confusing than an error here."""
+        if self.closed:
+            raise ProgrammingError("connection is closed")
+        if self._broken:
+            raise OperationalError(
+                "connection is broken (a transport error or an abandoned "
+                "stream left it out of sync); call reconnect()"
+            )
+        if self._streaming:
+            raise ProgrammingError(_BUSY_STREAMING)
 
     # -- one-shot query (OP_QUERY) --
     def _query(self, sql: str, consistency: int):
@@ -735,49 +795,87 @@ class Connection:
         except (OperationalError, ProgrammingError, InterfaceError):
             pass
 
-    def stream(self, sql: str, consistency: "int | None" = None):
-        """Yield rows one at a time, holding one chunk instead of the whole
-        result — for exports and large scans.
+    def stream(self, sql: str, consistency: "int | None" = None) -> "RowStream":
+        """Run `sql` over `OP_QUERY_STREAM` and return a :class:`RowStream` —
+        an iterator of rows that holds one chunk at a time instead of the
+        whole result, for exports and large scans.
 
-        Uses `OP_QUERY_STREAM`: the server sends a header, then chunks, then
-        an end frame. The connection is busy for the whole stream, so do not
-        run other statements on it until the generator is exhausted (or
-        closed, which drains the rest).
+        The connection is busy for the whole stream: every other statement on
+        it raises `ProgrammingError` until the stream finishes. It finishes
+        when you iterate to the end, when you `close()` it (which drains what
+        the server already has in flight), or when it is garbage-collected.
+        A stream abandoned with too much still to come marks the connection
+        broken instead of draining, so `is_usable()` turns False and a pool
+        discards it rather than handing on a desynced socket.
+
+        Use it as a context manager when you may stop early::
+
+            with conn.stream("SELECT id, pad FROM big") as rows:
+                print(rows.columns)
+                for row in rows:
+                    if enough(row):
+                        break
 
         Takes no parameters: the streaming opcode carries SQL text. Raises
         `ProgrammingError` against a server that does not know the opcode.
         """
-        level = self._consistency if consistency is None else consistency
+        level = (
+            self._consistency
+            if consistency is None
+            else Consistency.resolve(consistency)
+        )
         body = sql.encode("utf-8")
         req = bytes([_OP_QUERY_STREAM, level]) + struct.pack("<I", len(body)) + body
-        r = self._roundtrip(req)
-        tag = r.u8()
-        if tag == _RESP_ERROR:
-            msg = r.text()
-            if "unknown opcode" in msg:
-                raise ProgrammingError(f"server does not support streaming: {msg}")
-            raise ProgrammingError(msg)
-        if tag in (_RESP_MUTATION, _RESP_DDL):
-            return  # not a row-producing statement: nothing to yield
-        if tag != _RESP_ROWS_HEADER:
-            raise InterfaceError(f"unexpected response tag {tag} to stream request")
-        columns = [r.text() for _ in range(r.u32())]
-        self._stream_columns = columns
-        while True:
-            fr = _Reader(self._read_frame())
-            t = fr.u8()
-            if t == _RESP_ROWS_CHUNK:
-                for _ in range(fr.u32()):
-                    yield tuple(
-                        _decode_value(_Reader(fr.blob())) for _ in range(fr.u32())
-                    )
-            elif t == _RESP_ROWS_END:
-                return
-            elif t == _RESP_ERROR:
-                # Rows already yielded are valid; the statement failed partway.
-                raise ProgrammingError(fr.text())
-            else:
-                raise InterfaceError(f"unexpected frame tag {t} in stream")
+        r = self._stream_open(req)
+        try:
+            tag = r.u8()
+            if tag == _RESP_ERROR:
+                msg = r.text()
+                if "unknown opcode" in msg:
+                    raise ProgrammingError(f"server does not support streaming: {msg}")
+                raise ProgrammingError(msg)
+            if tag == _RESP_MUTATION:
+                # Not a row-producing statement: one ordinary frame is the
+                # whole reply, so the stream is empty and already finished.
+                return RowStream(self, [], r.u64(), done=True)
+            if tag == _RESP_DDL:
+                return RowStream(self, [], 0, done=True)
+            if tag != _RESP_ROWS_HEADER:
+                # An unexpected reply leaves us unable to say how many frames
+                # it is made of, so the socket position is unknown.
+                self._broken = True
+                raise InterfaceError(f"unexpected response tag {tag} to stream request")
+            columns = [r.text() for _ in range(r.u32())]
+        except BaseException:
+            # Nothing will consume the stream, so release the claim here.
+            self._stream_release()
+            raise
+        return RowStream(self, columns, 0, done=False)
+
+    def _stream_open(self, req: bytes) -> "_Reader":
+        """Claim the connection for a stream and send `req`, returning its
+        first response frame. The claim is released by the `RowStream` (or by
+        `stream()` itself if no stream is handed out)."""
+        self._check_ready()
+        with self._lock:
+            if self._streaming:
+                raise ProgrammingError(_BUSY_STREAMING)
+            self._streaming = True
+            try:
+                self._write_frame(req)
+                return _Reader(self._read_frame())
+            except OperationalError:
+                self._streaming = False
+                self._broken = True
+                raise
+            except OSError as e:
+                self._streaming = False
+                self._broken = True
+                raise OperationalError(f"query transport failed: {e}") from e
+
+    def _stream_release(self) -> None:
+        """Give the connection back once a stream's exchange is over."""
+        self._streaming = False
 
     def _execute_params(self, sql: str, params: Sequence[Any], consistency: int):
         """Run `sql` with `params` bound as typed values over the prepared
@@ -852,7 +950,7 @@ class Connection:
     def commit(self) -> None:  # no-op: skaidb auto-commits each statement
         pass
 
-    def rollback(self) -> None:  # no-op: skaidb is non-transactional
+    def rollback(self) -> None:  # refused: there is nothing to roll back
         raise OperationalError("skaidb does not support rollback (auto-commit only)")
 
     def close(self) -> None:
@@ -865,6 +963,138 @@ class Connection:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+class RowStream:
+    """A streamed result set from :meth:`Connection.stream`: iterate it for
+    rows, one chunk held in memory at a time.
+
+    It owns the connection until the exchange is over (PROTOCOL.md §3 — no
+    other request may be sent until RowsEnd or Error), so any statement run
+    on that connection meanwhile raises `ProgrammingError`. Iterating to the
+    end releases it; so does `close()`, which drains the frames the server
+    already sent, and so does dropping the last reference. `columns` carries
+    the result's column names, which arrive in the header before any row.
+    """
+
+    def __init__(self, conn: Connection, columns: List[str], affected: int, done: bool):
+        self._conn = conn
+        self.columns = columns
+        # Rows affected, when the statement turned out to be a mutation.
+        self.affected = affected
+        self._rows = iter(())
+        self._done = False
+        self._released = False
+        if done:
+            self._finish()
+
+    def __iter__(self) -> "RowStream":
+        return self
+
+    def __next__(self) -> tuple:
+        while True:
+            try:
+                return next(self._rows)
+            except StopIteration:
+                pass  # current chunk drained; pull the next frame
+            if self._done:
+                raise StopIteration
+            self._next_frame()
+
+    def _finish(self) -> None:
+        """Mark the exchange over and hand the connection back. Idempotent,
+        because close() and the iterator both reach it."""
+        self._done = True
+        if not self._released:
+            self._released = True
+            self._conn._stream_release()
+
+    def _next_frame(self) -> None:
+        """Read the next stream frame into the row buffer, or end the stream."""
+        conn = self._conn
+        try:
+            fr = _Reader(conn._read_frame())
+            t = fr.u8()
+            if t == _RESP_ROWS_CHUNK:
+                rows = []
+                for _ in range(fr.u32()):
+                    rows.append(
+                        tuple(_decode_value(_Reader(fr.blob())) for _ in range(fr.u32()))
+                    )
+                self._rows = iter(rows)
+                return
+        except OperationalError:
+            # Dead socket mid-stream: there is nothing left to drain and the
+            # connection cannot carry another statement.
+            conn._broken = True
+            self._finish()
+            raise
+        except OSError as e:
+            conn._broken = True
+            self._finish()
+            raise OperationalError(f"stream transport failed: {e}") from e
+        except InterfaceError:
+            # A frame we could not parse: we no longer know what the peer is
+            # sending, so the connection is not reusable.
+            conn._broken = True
+            self._finish()
+            raise
+        if t == _RESP_ROWS_END:
+            self._finish()
+            return
+        if t == _RESP_ERROR:
+            # Rows already yielded are valid; the statement failed partway.
+            # The error frame ends the exchange, so the socket is back at a
+            # request boundary and the connection stays usable.
+            self._finish()
+            raise ProgrammingError(fr.text())
+        conn._broken = True
+        self._finish()
+        raise InterfaceError(f"unexpected frame tag {t} in stream")
+
+    def close(self) -> None:
+        """Finish with the stream, draining whatever the server has already
+        queued so the connection is left at a request boundary. If the rest of
+        the result is longer than `_STREAM_DRAIN_MAX_FRAMES` frames, or the
+        drain hits a transport error, the connection is marked broken instead
+        — a discarded connection costs a reconnect, a desynced one costs the
+        next caller a baffling error. Idempotent."""
+        if self._released:
+            return
+        self._rows = iter(())
+        conn = self._conn
+        # Nothing to drain if the stream ran out or the socket is already gone.
+        if not self._done and not conn.closed:
+            try:
+                for _ in range(_STREAM_DRAIN_MAX_FRAMES):
+                    payload = conn._read_frame()
+                    tag = payload[0] if payload else None
+                    if tag in (_RESP_ROWS_END, _RESP_ERROR):
+                        break
+                    if tag != _RESP_ROWS_CHUNK:
+                        conn._broken = True
+                        break
+                else:
+                    conn._broken = True
+            except (OperationalError, OSError):
+                conn._broken = True
+        self._finish()
+
+    def __enter__(self) -> "RowStream":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def __del__(self):
+        # The abandoned-stream path that has no explicit close: a `for` loop
+        # left by `break` or an exception, or a stream that simply went out of
+        # scope. Errors here are unraisable, and at interpreter shutdown even
+        # module globals may be gone, so nothing is allowed to escape.
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def _enc_str(s: str) -> bytes:

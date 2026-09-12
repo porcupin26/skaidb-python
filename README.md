@@ -87,6 +87,28 @@ instead of one RTT per row. Each row autocommits; on a failure the error
 names the row index and earlier rows stay applied. Falls back to the
 per-row loop automatically on servers that predate the opcode.
 
+### Streaming large results
+
+`conn.stream(sql)` returns a `RowStream`: an iterator that holds one chunk of
+rows instead of the whole result, for exports and large scans. Column names
+arrive in the header, before any row, and are on `rows.columns`. It takes no
+parameters — the streaming wire op carries SQL text.
+
+```python
+with conn.stream("SELECT id, pad FROM big ORDER BY id") as rows:
+    print(rows.columns)                  # ['id', 'pad']
+    for row in rows:
+        if enough(row):
+            break                        # close() drains the rest for you
+```
+
+The connection is busy for the whole stream: any other statement on it raises
+`ProgrammingError` until the stream ends. Use the `with` block (or `close()`)
+when you might stop early — leaving the stream to be garbage-collected also
+works, but a stream abandoned with a lot still in flight marks the connection
+broken rather than reading it all, so a pool discards it instead of handing
+on a socket with rows still queued on it.
+
 ### Consistency
 
 skaidb is leaderless with tunable consistency. Default is `QUORUM`:

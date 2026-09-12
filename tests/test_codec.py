@@ -1,6 +1,7 @@
 """Value-codec and prepared-statement framing tests for the skaidb driver.
 
-Pure standard library (`unittest`) — run with `python -m unittest` from
+Pure standard library (`unittest`) — run with
+`python -m unittest tests.test_codec` (or `python -m pytest tests`) from
 `drivers/python`. No server required: the value codec is checked by round-trip
 through the (production-proven) decoder plus golden byte layouts matching the
 Rust `skaidb-types` codec, and the prepared-statement wire frames are checked
