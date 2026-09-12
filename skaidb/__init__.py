@@ -840,6 +840,17 @@ class Connection:
                 return RowStream(self, [], r.u64(), done=True)
             if tag == _RESP_DDL:
                 return RowStream(self, [], 0, done=True)
+            if tag == _RESP_RESULT_SETS:
+                # A procedure that EMITs. The server answers any non-row
+                # result as ONE ordinary frame even over the stream opcode,
+                # so the socket is at a frame boundary and the connection is
+                # perfectly healthy — it is only this API that cannot carry
+                # the shape. Refuse the call, not the connection: marking it
+                # broken here retired a working socket over a `CALL`.
+                raise InterfaceError(
+                    "this statement returns multiple result sets, which stream() "
+                    "cannot carry; run it with execute() instead"
+                )
             if tag != _RESP_ROWS_HEADER:
                 # An unexpected reply leaves us unable to say how many frames
                 # it is made of, so the socket position is unknown.
@@ -1058,7 +1069,14 @@ class RowStream:
         the result is longer than `_STREAM_DRAIN_MAX_FRAMES` frames, or the
         drain hits a transport error, the connection is marked broken instead
         — a discarded connection costs a reconnect, a desynced one costs the
-        next caller a baffling error. Idempotent."""
+        next caller a baffling error. Idempotent.
+
+        The frame cap bounds the drain in FRAMES, and the socket's read
+        timeout bounds it in time. With `connect(timeout=None)` there is no
+        second bound: a peer that is alive but silent blocks this call
+        forever. That is the same exposure every other read on the
+        connection has under that setting, and the reason the default is not
+        `None`."""
         if self._released:
             return
         self._rows = iter(())
