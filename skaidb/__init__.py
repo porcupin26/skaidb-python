@@ -39,7 +39,7 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 # the fallback for running straight from a source checkout that was never
 # installed (tests/test_version.py keeps it equal to pyproject.toml). The
 # server records it in its `drivers` table via the Hello frame.
-_FALLBACK_VERSION = "1.0.0"
+_FALLBACK_VERSION = "1.0.1"
 
 
 def _detect_version() -> str:

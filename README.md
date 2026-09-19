@@ -11,10 +11,10 @@ library** (`socket`, `ssl`, `hashlib`, `hmac`) — no dependencies, one module,
 Python 3.8 through 3.14.
 
 - Package: [`skaidb` on PyPI](https://pypi.org/project/skaidb/)
-- Full reference: [`docs/`](docs/) — [getting started](docs/getting-started.md),
-  [API reference](docs/api.md), [TLS](docs/tls.md),
-  [streaming](docs/streaming.md), [pooling](docs/pooling.md),
-  [changelog](CHANGELOG.md)
+- Full reference: [`docs/`](https://github.com/porcupin26/skaidb-python/tree/main/docs) — [getting started](https://github.com/porcupin26/skaidb-python/blob/main/docs/getting-started.md),
+  [API reference](https://github.com/porcupin26/skaidb-python/blob/main/docs/api.md), [TLS](https://github.com/porcupin26/skaidb-python/blob/main/docs/tls.md),
+  [streaming](https://github.com/porcupin26/skaidb-python/blob/main/docs/streaming.md), [pooling](https://github.com/porcupin26/skaidb-python/blob/main/docs/pooling.md),
+  [changelog](https://github.com/porcupin26/skaidb-python/blob/main/CHANGELOG.md)
 - Server documentation: <https://skaidb.org/docs/>
 - Wire protocol the driver speaks: <https://skaidb.org/docs/PROTOCOL.html>
 
@@ -132,7 +132,7 @@ conn = skaidb.connect(host="db1", tls_insecure=True)            # dev only: no v
 Any of the three enables TLS. The server name presented as SNI and checked
 against the certificate is `tls_server_name` (default `"skaidb"`, the SAN the
 server's certificate carries). SCRAM runs inside the TLS session. The driver
-does not present a client certificate. Details: [docs/tls.md](docs/tls.md).
+does not present a client certificate. Details: [docs/tls.md](https://github.com/porcupin26/skaidb-python/blob/main/docs/tls.md).
 
 ### Consistency
 
@@ -286,7 +286,7 @@ big enough that draining costs more than a reconnect, so the connection is
 raise `OperationalError`, and a pool discards it rather than handing on a
 socket with rows still queued. Rule of thumb: iterate to the end, or stop
 early inside a `with` block and expect the connection to be recycled if a lot
-was still in flight. Details: [docs/streaming.md](docs/streaming.md).
+was still in flight. Details: [docs/streaming.md](https://github.com/porcupin26/skaidb-python/blob/main/docs/streaming.md).
 
 ## Connection pool
 
@@ -306,7 +306,7 @@ blocks — when no idle connection is available a new one is dialed, and a
 returned connection beyond `maxsize` is closed. Connections are validated with
 `is_usable()` on checkout and check-in, so one broken by a transport error or
 an undrained stream is closed and replaced transparently. Details:
-[docs/pooling.md](docs/pooling.md).
+[docs/pooling.md](https://github.com/porcupin26/skaidb-python/blob/main/docs/pooling.md).
 
 ## Streams (`CREATE STREAM`)
 
@@ -376,7 +376,7 @@ which is what a [pool](#connection-pool) gives you.
 
 ## Examples
 
-[`examples/`](examples/) contains runnable scripts: `basic.py`, `streaming.py`,
+[`examples/`](https://github.com/porcupin26/skaidb-python/tree/main/examples) contains runnable scripts: `basic.py`, `streaming.py`,
 `pool.py`, `tls.py`, `subscribe.py`. Each takes the host/port/user/password on
 the command line and defaults to `localhost:7000`.
 
@@ -395,4 +395,4 @@ python -m pytest -q          # unit tests; no server needed
 
 ## License
 
-[SSPL-1.0](LICENSE) (Server Side Public License), the same license as skaidb.
+[SSPL-1.0](https://github.com/porcupin26/skaidb-python/blob/main/LICENSE) (Server Side Public License), the same license as skaidb.

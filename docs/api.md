@@ -49,6 +49,12 @@ shuffle it; for each endpoint until one succeeds: TCP connect (with
 (best-effort, ignored by old servers) and `USE "<database>"` if `database`
 was given.
 
+The server records the driver name and `__version__` carried by `Hello` in
+its `drivers` table **asynchronously**: `Hello` is acknowledged before the
+row is written, so a `SELECT` on the `drivers` table issued immediately after
+`connect()` may not show the new connection yet. Poll briefly if a test or a
+health check depends on the row.
+
 | Parameter | Notes |
 |-----------|-------|
 | `host`, `port` | Used only when `seeds` is not given. |

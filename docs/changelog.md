@@ -13,6 +13,12 @@ version is defined once in `pyproject.toml`; `skaidb.__version__` reports it
 and the driver sends it to the server in the Hello frame, so the server's
 `drivers` table shows exactly which release each client runs.
 
+## 1.0.1 — 2026-09-19
+
+Documentation only: absolute README links so they work on PyPI, and the
+`drivers`-table note in [api.md](api.md#connect). No code changes.
+[`CHANGELOG.md`](../CHANGELOG.md#101---2026-09-19).
+
 ## 1.0.0 — 2026-09-19
 
 First standalone release on PyPI; the full feature list is in the root

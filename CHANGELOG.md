@@ -4,6 +4,18 @@ All notable changes to the skaidb Python driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] - 2026-09-19
+
+### Documentation
+- Absolute README links for PyPI: every link in `README.md` that pointed at
+  a file in the repository (`docs/`, `CHANGELOG.md`, `LICENSE`, `examples/`)
+  is now an absolute GitHub URL, because PyPI renders the README verbatim and
+  does not rewrite relative links.
+- `docs/api.md` notes that the server records the driver name and version
+  from the Hello frame asynchronously, so a `SELECT` on the `drivers` table
+  right after connecting may not show the row yet.
+- No code changes.
+
 ## [1.0.0] - 2026-09-19
 
 First release as a standalone package on PyPI (`pip install skaidb`). The
@@ -38,4 +50,5 @@ history is carried over.
 - PEP 639 license metadata (`SSPL-1.0`), `py.typed`, complete project URLs.
 - `InterfaceError` and `__version__` are exported in `__all__`.
 
+[1.0.1]: https://github.com/porcupin26/skaidb-python/releases/tag/v1.0.1
 [1.0.0]: https://github.com/porcupin26/skaidb-python/releases/tag/v1.0.0
