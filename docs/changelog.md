@@ -1,0 +1,19 @@
+# Changelog
+
+The release history lives in [`CHANGELOG.md`](../CHANGELOG.md) at the
+repository root, one entry per published version. Releases are tagged
+`vX.Y.Z` on GitHub and published to PyPI as
+[`skaidb`](https://pypi.org/project/skaidb/) by the release workflow.
+
+## Versioning
+
+The driver follows [Semantic Versioning](https://semver.org/): a major bump
+for a breaking API change, minor for new features, patch for fixes. The
+version is defined once in `pyproject.toml`; `skaidb.__version__` reports it
+and the driver sends it to the server in the Hello frame, so the server's
+`drivers` table shows exactly which release each client runs.
+
+## 1.0.0 — 2026-09-19
+
+First standalone release on PyPI; the full feature list is in the root
+[`CHANGELOG.md`](../CHANGELOG.md#100---2026-09-19).

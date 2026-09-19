@@ -1,15 +1,52 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "skaidb"
-version = "0.1.0"
+version = "1.0.0"
 description = "Official skaidb driver (DB-API 2.0). Pure standard library, no dependencies."
 readme = "README.md"
 requires-python = ">=3.8"
-license = { text = "SSPL-1.0" }
-keywords = ["skaidb", "database", "sql", "dbapi", "pep249"]
+license = "SSPL-1.0"
+license-files = ["LICENSE"]
+authors = [{ name = "skaidb" }]
+keywords = ["skaidb", "database", "sql", "dbapi", "pep249", "driver", "client"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy",
+  "Topic :: Database",
+  "Topic :: Database :: Front-Ends",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://skaidb.org"
+Documentation = "https://skaidb.org/docs/"
+Source = "https://github.com/porcupin26/skaidb-python"
+Issues = "https://github.com/porcupin26/skaidb-python/issues"
+Changelog = "https://github.com/porcupin26/skaidb-python/blob/main/CHANGELOG.md"
+"Wire protocol" = "https://skaidb.org/docs/PROTOCOL.html"
 
 [tool.setuptools]
 packages = ["skaidb"]
+
+[tool.setuptools.package-data]
+skaidb = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

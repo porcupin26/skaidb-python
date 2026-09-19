@@ -21,10 +21,6 @@ learn. Placeholders use the ``qmark`` style (``?``), exactly like ``sqlite3``.
 
 from __future__ import annotations
 
-# Reported in the server's `drivers` table via Hello; keep in sync with
-# pyproject.toml.
-__version__ = "0.1.0"
-
 import datetime as _dt
 import decimal
 import hashlib
@@ -38,7 +34,27 @@ import uuid
 from contextlib import contextmanager
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
+# The package version lives in ONE place, pyproject.toml. At runtime it is read
+# back from the installed distribution's metadata; the literal below is only
+# the fallback for running straight from a source checkout that was never
+# installed (tests/test_version.py keeps it equal to pyproject.toml). The
+# server records it in its `drivers` table via the Hello frame.
+_FALLBACK_VERSION = "1.0.0"
+
+
+def _detect_version() -> str:
+    try:
+        from importlib.metadata import version as _dist_version
+
+        return _dist_version("skaidb")
+    except Exception:  # not installed (source checkout), or no metadata
+        return _FALLBACK_VERSION
+
+
+__version__ = _detect_version()
+
 __all__ = [
+    "__version__",
     "connect",
     "Connection",
     "ConnectionPool",
@@ -46,6 +62,7 @@ __all__ = [
     "Cursor",
     "RowStream",
     "Error",
+    "InterfaceError",
     "DatabaseError",
     "OperationalError",
     "ProgrammingError",
