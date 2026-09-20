@@ -1,15 +1,49 @@
 name: Publish to PyPI
 
+# Pushing a version tag (vX.Y.Z) is the whole release: this workflow runs the
+# tests, builds the sdist and wheel, uploads them to PyPI and creates the
+# GitHub Release with the matching CHANGELOG.md section as its notes. There is
+# no manual step. GitHub-hosted runners only.
+#
+# Secret: PYPI_API_TOKEN — a PyPI API token scoped to the "skaidb" project
+# (https://pypi.org/manage/project/skaidb/settings/ -> "Create a token").
+# Without it the PyPI upload is skipped with a warning; the run still succeeds
+# and the GitHub Release is still created.
+
 on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: read
+
 jobs:
+  test:
+    name: Tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install
+        run: python -m pip install --upgrade pip pytest
+      - name: Unit tests (no server needed)
+        run: python -m pytest -q tests
+      - name: Import check
+        run: python -c "import skaidb; print(skaidb.__version__)"
+
   build:
+    name: Build sdist + wheel
+    needs: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: python -m pip install --upgrade build twine
@@ -17,23 +51,73 @@ jobs:
         run: |
           v="${GITHUB_REF_NAME#v}"
           p="$(python -c "import re;print(re.search(r'^version\s*=\s*\"([^\"]+)\"',open('pyproject.toml').read(),re.M).group(1))")"
-          test "$v" = "$p" || { echo "tag v$v != pyproject version $p"; exit 1; }
+          test "$v" = "$p" || { echo "::error::tag v$v != pyproject.toml version $p"; exit 1; }
+      - name: CHANGELOG.md must have an entry for the version
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          grep -q "^## \[$v\]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no '## [$v]' section; it becomes the GitHub Release notes"; exit 1; }
       - run: python -m build
       - run: python -m twine check --strict dist/*
-      - uses: actions/upload-artifact@v4
+      - name: Installed wheel reports the tagged version
+        run: |
+          python -m pip install dist/*.whl
+          got="$(cd /tmp && python -c 'import skaidb; print(skaidb.__version__)')"
+          test "$got" = "${GITHUB_REF_NAME#v}" || { echo "::error::installed version $got != tag ${GITHUB_REF_NAME#v}"; exit 1; }
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
+          if-no-files-found: error
 
   publish:
+    name: PyPI + GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release create
+    env:
+      # The secrets context is not available in `if:`; carry a boolean instead.
+      HAS_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN != '' }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Publish to PyPI (sdist + wheel)
+        if: env.HAS_PYPI_TOKEN == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
           skip-existing: true
+      - name: PyPI upload skipped (no PYPI_API_TOKEN secret)
+        if: env.HAS_PYPI_TOKEN != 'true'
+        run: |
+          msg="The PYPI_API_TOKEN repository secret is not set, so ${GITHUB_REF_NAME} was NOT uploaded to PyPI. Create a project-scoped token at https://pypi.org/manage/project/skaidb/settings/ and add it with: gh secret set PYPI_API_TOKEN --repo ${GITHUB_REPOSITORY}. Then re-run this job."
+          echo "::warning title=PyPI upload skipped::$msg"
+          { echo "## PyPI upload skipped"; echo; echo "$msg"; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Release notes from CHANGELOG.md
+        run: |
+          python - "${GITHUB_REF_NAME#v}" <<'PY' > release-notes.md
+          import re, sys
+          v = sys.argv[1]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(r"^## \[" + re.escape(v) + r"\][^\n]*\n(.*?)(?=^## \[|^\[[^\]]+\]: |\Z)", text, re.M | re.S)
+          body = (m.group(1).strip() if m else "") or f"skaidb {v}. See CHANGELOG.md."
+          print(body)
+          print()
+          print(f"Install: `pip install skaidb=={v}` — https://pypi.org/project/skaidb/{v}/")
+          PY
+          cat release-notes.md
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $tag already exists; refreshing its assets"
+            gh release upload "$tag" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "skaidb $tag" --notes-file release-notes.md
+          fi

@@ -4,6 +4,19 @@ All notable changes to the skaidb Python driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.2] - 2026-09-20
+
+1.0.2 — release automation: published from GitHub Actions.
+
+### Changed
+- Pushing a `vX.Y.Z` tag now runs the tests, builds the sdist and wheel,
+  uploads them to PyPI and creates the GitHub Release (with this changelog
+  section as its notes) from GitHub Actions, with no manual step. The publish
+  workflow refuses a tag that does not match `pyproject.toml` or has no
+  changelog entry, and skips the PyPI upload with a warning instead of failing
+  when the `PYPI_API_TOKEN` secret is absent.
+- No code changes.
+
 ## [1.0.1] - 2026-09-19
 
 ### Documentation
@@ -50,5 +63,6 @@ history is carried over.
 - PEP 639 license metadata (`SSPL-1.0`), `py.typed`, complete project URLs.
 - `InterfaceError` and `__version__` are exported in `__all__`.
 
+[1.0.2]: https://github.com/porcupin26/skaidb-python/releases/tag/v1.0.2
 [1.0.1]: https://github.com/porcupin26/skaidb-python/releases/tag/v1.0.1
 [1.0.0]: https://github.com/porcupin26/skaidb-python/releases/tag/v1.0.0
