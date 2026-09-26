@@ -4,6 +4,15 @@ All notable changes to the skaidb Python driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.1] - 2026-09-26
+
+### Fixed
+- Documentation: the automatic-reconnect note said a retried `INSERT` on an
+  existing primary key fails. A plain `INSERT` replaces that row (upsert),
+  so the retry is harmless; the statements that can apply twice are the
+  ones that compute from the current row (`SET n = n + 1`, `ON CONFLICT DO
+  UPDATE` increments) and sequence-keyed inserts. No code changes.
+
 ## [1.1.0] - 2026-09-26
 
 ### Added

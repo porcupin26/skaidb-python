@@ -67,7 +67,7 @@ health check depends on the row.
 | `tls`, `tls_ca`, `tls_insecure`, `tls_server_name` | See [tls.md](tls.md). Any of the first three enables TLS. |
 | `tls_client_cert`, `tls_client_key` | PEM files of a client certificate to present over TLS (enables TLS). Needed for `auth_mechanism="certificate"`. |
 | `auth_mechanism` | `"scram"` (default: `user`/`password`) or `"certificate"` (EXTERNAL: the client certificate's Common Name is the user; the server needs `auth.x509_enabled`). |
-| `auto_reconnect` | Default `True`. After a transport failure the next statement re-dials first, and a statement whose connection fails in transit re-dials — trying the other endpoints before the failed one — and runs once more (whole statement, prepare included; at-least-once on failover). `False` raises `OperationalError` instead. |
+| `auto_reconnect` | Default `True`. After a transport failure the next statement re-dials first, and a statement whose connection fails in transit re-dials — trying the other endpoints before the failed one — and runs once more (whole statement, prepare included; at-least-once on failover: a plain `INSERT` replaces the same row, but `SET n = n + 1`-style or sequence-keyed writes can apply twice). `False` raises `OperationalError` instead. |
 
 Raises `OperationalError` when no endpoint could be connected and
 authenticated (the message lists every endpoint's failure), including

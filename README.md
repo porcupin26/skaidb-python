@@ -116,9 +116,14 @@ that just failed; a connection already broken re-dials before its next
 statement. Prepared statements are re-prepared on the new connection, so
 `executemany` survives a failover too. The retry repeats the whole
 statement, so one the old node had already applied can run twice
-(at-least-once on failover — an `INSERT` on an existing primary key then
-fails rather than duplicating). A stream cannot be retried mid-way. Pass
-`auto_reconnect=False` to handle `OperationalError` yourself.
+(at-least-once on failover). Most writes are idempotent — a plain `INSERT`
+replaces the row with the same primary key, and `DELETE` or an `UPDATE` that
+sets fixed values lands the same row twice — but a statement that computes
+from the current row does not: `UPDATE … SET n = n + 1`, `INSERT … ON
+CONFLICT DO UPDATE SET n = n + 1`, or a row keyed by a sequence. Run those
+with `auto_reconnect=False` (or make them idempotent). A stream cannot be
+retried mid-way. Pass `auto_reconnect=False` to handle `OperationalError`
+yourself.
 
 **Certificate login.** With `auth_mechanism="certificate"` and
 `tls_client_cert` / `tls_client_key`, the TLS client certificate is the

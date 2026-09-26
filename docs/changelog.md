@@ -21,6 +21,11 @@ literal in `skaidb/__init__.py`), add the `## [X.Y.Z]` section to
 The `Publish to PyPI` workflow runs the tests, builds the sdist and wheel,
 uploads them to PyPI and creates the GitHub Release; nothing is done by hand.
 
+## 1.1.1 — 2026-09-26
+
+Documentation fix: what the automatic-reconnect retry can apply twice (a
+plain `INSERT` is an upsert and is safe). [`CHANGELOG.md`](../CHANGELOG.md#111---2026-09-26).
+
 ## 1.1.0 — 2026-09-26
 
 Automatic reconnect with failover to the other endpoints, certificate login
