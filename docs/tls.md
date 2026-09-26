@@ -52,9 +52,25 @@ pool = skaidb.pool(seeds=["db1", "db2", "db3"], tls_ca="/etc/skaidb/ca.crt",
 
 ## Client certificates
 
-The driver does not present a client certificate; identity is the SCRAM
-user. A server configured to require client certificates on the binary port
-will reject this driver's handshake.
+`tls_client_cert` / `tls_client_key` (PEM files) make the driver present a
+client certificate in the TLS handshake, which a server with
+`client_tls = "required"` and client verification needs. On its own the
+certificate only opens the TLS session; the login is still the SCRAM user.
+
+With `auth_mechanism="certificate"` the certificate IS the login (wire
+mechanism EXTERNAL): the server maps its Common Name to a role and no
+password is sent. The server needs `auth.x509_enabled`, and its client CA
+must have signed the certificate.
+
+```python
+conn = skaidb.connect(host="db1", tls_ca="/etc/skaidb/ca.crt",
+                      tls_client_cert="/etc/app/app.crt",
+                      tls_client_key="/etc/app/app.key",
+                      auth_mechanism="certificate", database="app")
+```
+
+Pass `user` only to assert the expected identity: a certificate mapped to a
+different role fails the connect.
 
 ## Failure modes
 

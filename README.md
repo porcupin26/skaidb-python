@@ -82,6 +82,9 @@ skaidb.connect(
     connect_timeout=None,         # override the dial timeout only
     read_timeout=None,            # override the read timeout only
     tls=False, tls_ca=None, tls_insecure=False, tls_server_name="skaidb",
+    tls_client_cert=None, tls_client_key=None,  # present a client certificate
+    auth_mechanism="scram",       # or "certificate": the client cert is the login
+    auto_reconnect=True,          # re-dial + retry once after a transport failure
 ) -> skaidb.Connection
 ```
 
@@ -105,6 +108,23 @@ Each seed is `"host"` or `"host:port"` (the port after the last colon wins;
 for an IPv6 literal use `host=`/`port=` instead). `conn.reconnect()` re-dials
 across the same seeds and re-authenticates, discarding the connection's
 prepared statements.
+
+**Automatic reconnect** (`auto_reconnect=True`, the default). When a node
+goes away (a rolling restart, a crash), the statement whose connection
+failed re-dials and runs once more, trying the OTHER seeds before the one
+that just failed; a connection already broken re-dials before its next
+statement. Prepared statements are re-prepared on the new connection, so
+`executemany` survives a failover too. The retry repeats the whole
+statement, so one the old node had already applied can run twice
+(at-least-once on failover — an `INSERT` on an existing primary key then
+fails rather than duplicating). A stream cannot be retried mid-way. Pass
+`auto_reconnect=False` to handle `OperationalError` yourself.
+
+**Certificate login.** With `auth_mechanism="certificate"` and
+`tls_client_cert` / `tls_client_key`, the TLS client certificate is the
+credential: its Common Name is the user (pass `user` only to assert it), and
+no password is sent. The server needs `auth.x509_enabled` and a CA that
+signed the certificate.
 
 ### Timeouts
 
@@ -348,8 +368,9 @@ Exception
 
 - A server `Error` frame is a **statement** error (`ProgrammingError`); the
   connection stays usable.
-- A transport failure (`OperationalError`) marks the connection broken;
-  call `reconnect()` or let the pool replace it.
+- A transport failure (`OperationalError`) marks the connection broken. With
+  `auto_reconnect` (the default) the failed statement re-dials and retries
+  once; otherwise call `reconnect()` or let the pool replace it.
 - Outside the hierarchy: `ValueError` for an invalid consistency level or
   `maxsize < 1`, and `struct.error` for an `int` beyond 64 bits.
 

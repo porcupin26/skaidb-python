@@ -39,7 +39,7 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 # the fallback for running straight from a source checkout that was never
 # installed (tests/test_version.py keeps it equal to pyproject.toml). The
 # server records it in its `drivers` table via the Hello frame.
-_FALLBACK_VERSION = "1.0.2"
+_FALLBACK_VERSION = "1.1.0"
 
 
 def _detect_version() -> str:
@@ -192,7 +192,11 @@ def _decode_value(r: _Reader) -> Any:
     if tag == _TAG_DECIMAL:
         mantissa = int.from_bytes(r.take(16), "little", signed=True)
         scale = r.u32()
-        return decimal.Decimal(mantissa).scaleb(-scale)
+        # Built from its digits, not `Decimal(m).scaleb(-scale)`: scaleb
+        # rounds to the context precision (28 digits by default), which
+        # silently truncated wider mantissas (up to 38 digits on the wire).
+        digits = tuple(int(d) for d in str(abs(mantissa)))
+        return decimal.Decimal((1 if mantissa < 0 else 0, digits, -scale))
     if tag == _TAG_STRING:
         return r.text()
     if tag == _TAG_BYTES:
@@ -473,6 +477,11 @@ class Connection:
     # instance built without __init__ (a subclass wiring its own transport).
     _broken = False
     _streaming = False
+    # An instance built without __init__ wires its own transport and cannot
+    # be re-dialed, so it does not auto-reconnect.
+    _auto_reconnect = False
+    _cert_auth = False
+    _connected = None
 
     def __init__(
         self,
@@ -485,8 +494,21 @@ class Connection:
         database=None,
         tls_ctx=None,
         tls_server_name="skaidb",
+        auto_reconnect=True,
+        auth_mechanism="scram",
     ):
         self._consistency = Consistency.resolve(consistency)
+        # Re-dial transparently after a transport failure (see `_run`).
+        self._auto_reconnect = auto_reconnect
+        mech = str(auth_mechanism).lower()
+        if mech not in ("scram", "password", "certificate", "external", "x509"):
+            raise ProgrammingError(
+                f"unknown auth_mechanism {auth_mechanism!r} (use 'scram' or 'certificate')"
+            )
+        self._cert_auth = mech in ("certificate", "external", "x509")
+        # The endpoint the live socket is dialed to; a re-dial tries the
+        # others first.
+        self._connected: "Tuple[str, int] | None" = None
         self._lock = threading.Lock()
         self.closed = False
         # Set once a transport error, or an abandoned stream too long to
@@ -537,13 +559,19 @@ class Connection:
                 sock.settimeout(self._read_timeout)
                 self._sock = sock
                 self._file = sock.makefile("rb")
-                self._handshake(self._user, self._password)
+                if self._cert_auth:
+                    # The default user asserts nothing: the certificate's
+                    # Common Name is the login.
+                    self._handshake_certificate("" if self._user == "anonymous" else self._user)
+                else:
+                    self._handshake(self._user, self._password)
             except (OSError, OperationalError) as e:
                 errors.append(f"{host}:{port}: {e}")
                 self._drop_socket()
                 continue
             # Connected + authenticated: a fresh socket has no prepared
             # statements, no stream in flight and is not broken.
+            self._connected = (host, port)
             self._broken = False
             self._streaming = False
             self._prepared.clear()
@@ -589,6 +617,13 @@ class Connection:
         recover a broken connection."""
         if self.closed:
             raise ProgrammingError("connection is closed")
+        # Try every OTHER endpoint before the one that just failed: a member
+        # going down during a rolling restart still accepts a connect for a
+        # moment, and re-dialing it first lost the retry (and an 8-hour
+        # backfill) in production.
+        if self._connected in self._endpoints and len(self._endpoints) > 1:
+            self._endpoints.remove(self._connected)
+            self._endpoints.append(self._connected)
         self._drop_socket()
         self._open()
 
@@ -635,7 +670,40 @@ class Connection:
             raise OperationalError("connection closed by server")
         return buf
 
+    def _run(self, fn):
+        """Run one statement; if its connection fails in transit, re-dial
+        (walking the other endpoints first) and run it once more.
+
+        The retry repeats the WHOLE statement — prepare included, since
+        prepared ids die with the connection — and happens at most once. A
+        statement the old node had already applied can therefore run twice
+        (at-least-once on failover, as in the Rust driver); an INSERT on an
+        existing primary key then fails instead of duplicating. Pass
+        ``auto_reconnect=False`` to :func:`connect` to surface the failure
+        instead."""
+        try:
+            return fn()
+        except OperationalError:
+            if not (self._auto_reconnect and self._broken) or self.closed or self._streaming:
+                raise
+            self.reconnect()
+            return fn()
+
     # -- handshake --
+    def _handshake_certificate(self, user: str) -> None:
+        """EXTERNAL: the TLS client certificate is the credential (its
+        Common Name is the username; ``user`` may be empty or must equal
+        it). No exchange follows AuthStart; the outcome's signature is not
+        checked — TLS authenticated the server."""
+        if self._tls_ctx is None:
+            raise OperationalError("certificate authentication needs TLS with a client certificate")
+        self._write_frame(bytes([10]) + _enc_str(user) + _enc_str("") + bytes([2]))
+        r = _Reader(self._read_frame())
+        if r.u8() != 13:
+            raise OperationalError("bad handshake outcome")
+        if r.u8() != 1:
+            raise OperationalError(f"authentication denied: {r.text()}")
+
     def _handshake(self, user: str, password: str) -> None:
         with Connection._nonce_lock:
             Connection._nonce_counter += 1
@@ -734,6 +802,10 @@ class Connection:
         answer back, which is far more confusing than an error here."""
         if self.closed:
             raise ProgrammingError("connection is closed")
+        if self._broken and self._auto_reconnect and not self._streaming:
+            # Nothing of this request has been sent: re-dialing first is
+            # always safe.
+            self.reconnect()
         if self._broken:
             raise OperationalError(
                 "connection is broken (a transport error or an abandoned "
@@ -1158,19 +1230,19 @@ class Cursor:
         self._consistency = Consistency.resolve(consistency)
 
     def execute(self, sql: str, params: Optional[Sequence[Any]] = None) -> "Cursor":
+        conn = self.connection
         if params:
             # Bind as typed values over the prepared-statement path: `?` can
             # carry arrays (list/tuple) and nested documents (dict), which have
             # no SQL literal form. Falls back to text interpolation for
             # statement kinds the server won't prepare.
-            kind, a, b = self.connection._execute_params(
-                sql, params, self._consistency
+            kind, a, b = conn._run(
+                lambda: conn._execute_params(sql, params, self._consistency)
             )
         else:
             # No parameters: one-shot query. `_bind` still rejects a stray `?`.
-            kind, a, b = self.connection._query(
-                _bind(sql, None), self._consistency
-            )
+            text = _bind(sql, None)
+            kind, a, b = conn._run(lambda: conn._query(text, self._consistency))
         self._result_sets = []
         if kind == "sets":
             self._result_sets = list(a)
@@ -1195,6 +1267,9 @@ class Cursor:
         if not rows:
             self.rowcount = 0
             return
+        self.connection._run(lambda: self._executemany_once(sql, rows))
+
+    def _executemany_once(self, sql: str, rows: "list[list[Any]]") -> None:
         # One round-trip for the whole batch via the ExecuteBatch wire op
         # (prepare once, ship every param row in a single frame). Falls back
         # to the per-row loop for unpreparable statements and for servers
@@ -1327,6 +1402,10 @@ def connect(
     tls_ca: Optional[str] = None,
     tls_insecure: bool = False,
     tls_server_name: str = "skaidb",
+    tls_client_cert: Optional[str] = None,
+    tls_client_key: Optional[str] = None,
+    auth_mechanism: str = "scram",
+    auto_reconnect: bool = True,
 ) -> Connection:
     """Open a connection to skaidb and run the SCRAM handshake.
 
@@ -1337,30 +1416,60 @@ def connect(
     the default for both dial and reads; ``connect_timeout`` / ``read_timeout``
     override each independently (a read timeout can then sit above the server's
     statement timeout without also slowing dial failures).
+
+    ``auto_reconnect`` (default True): after a transport failure the next
+    statement re-dials first, and a statement whose connection fails in
+    transit is retried once on a fresh connection — the other endpoints are
+    tried before the one that failed (see :meth:`Connection._run` for the
+    at-least-once caveat). ``auth_mechanism="certificate"`` authenticates with
+    the TLS client certificate given by ``tls_client_cert`` / ``tls_client_key``
+    (its Common Name is the user; the server needs ``auth.x509_enabled``).
     """
     endpoints = _resolve_endpoints(host, port, seeds)
     ct = connect_timeout if connect_timeout is not None else timeout
     rt = read_timeout if read_timeout is not None else timeout
-    tls_ctx = _build_tls_context(tls, tls_ca, tls_insecure)
+    tls_ctx = _build_tls_context(tls, tls_ca, tls_insecure, tls_client_cert, tls_client_key)
     return Connection(
-        endpoints, user, password, consistency, ct, rt, database, tls_ctx, tls_server_name
+        endpoints,
+        user,
+        password,
+        consistency,
+        ct,
+        rt,
+        database,
+        tls_ctx,
+        tls_server_name,
+        auto_reconnect=auto_reconnect,
+        auth_mechanism=auth_mechanism,
     )
 
 
-def _build_tls_context(tls: bool, tls_ca: "str | None", tls_insecure: bool):
+def _build_tls_context(
+    tls: bool,
+    tls_ca: "str | None",
+    tls_insecure: bool,
+    client_cert: "str | None" = None,
+    client_key: "str | None" = None,
+):
     """Build a client ``ssl.SSLContext`` for the binary protocol, or ``None``
     for plaintext. TLS is enabled when ``tls`` is set or a CA / insecure flag
     is given. ``tls_ca`` verifies the server cert against a specific CA (the
     cluster ``ca.crt``); ``tls_insecure`` skips verification (self-signed/dev
     only — INSECURE); otherwise the system trust store is used."""
-    if not (tls or tls_ca or tls_insecure):
+    if not (tls or tls_ca or tls_insecure or client_cert):
         return None
+    if bool(client_cert) != bool(client_key):
+        raise ProgrammingError("tls_client_cert and tls_client_key go together")
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     if tls_insecure:
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
     elif tls_ca:
         ctx.load_verify_locations(tls_ca)
+    else:
+        ctx.load_default_certs()
+    if client_cert:
+        ctx.load_cert_chain(client_cert, client_key)
     return ctx
 
 

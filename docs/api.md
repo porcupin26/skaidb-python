@@ -65,6 +65,9 @@ health check depends on the row.
 | `database` | Runs `USE "<database>"` (identifier-quoted) as part of connecting. |
 | `seeds` | `"host"` or `"host:port"` strings tried in randomized order; the port after the **last** colon is used, bare names get `port`. IPv6 literals: use `host=`/`port=`. |
 | `tls`, `tls_ca`, `tls_insecure`, `tls_server_name` | See [tls.md](tls.md). Any of the first three enables TLS. |
+| `tls_client_cert`, `tls_client_key` | PEM files of a client certificate to present over TLS (enables TLS). Needed for `auth_mechanism="certificate"`. |
+| `auth_mechanism` | `"scram"` (default: `user`/`password`) or `"certificate"` (EXTERNAL: the client certificate's Common Name is the user; the server needs `auth.x509_enabled`). |
+| `auto_reconnect` | Default `True`. After a transport failure the next statement re-dials first, and a statement whose connection fails in transit re-dials — trying the other endpoints before the failed one — and runs once more (whole statement, prepare included; at-least-once on failover). `False` raises `OperationalError` instead. |
 
 Raises `OperationalError` when no endpoint could be connected and
 authenticated (the message lists every endpoint's failure), including
@@ -137,9 +140,13 @@ Connection.closed: bool
 - `reconnect()` drops the socket, re-dials (shuffled seeds), re-authenticates,
   re-sends Hello and `USE`, and clears the prepared-statement cache. Raises
   `ProgrammingError` on a closed connection.
-- A broken connection refuses statements with `OperationalError("connection is
-  broken …; call reconnect()")` rather than retrying: its socket may hold
-  unread frames, and writing into it would read someone else's answer back.
+- A broken connection never writes into its old socket (it may hold unread
+  frames, and writing into it would read someone else's answer back). With
+  `auto_reconnect` the next statement re-dials first; without it the
+  statement raises `OperationalError("connection is broken …; call
+  reconnect()")`.
+- `reconnect()` tries the other endpoints before the one it was connected
+  to.
 - `close()` is idempotent. `with connect(...) as conn:` closes on exit.
 
 ### Transactions

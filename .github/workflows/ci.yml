@@ -28,6 +28,14 @@ jobs:
         run: python -m pip install --upgrade pip pytest
       - name: Unit tests (no server needed)
         run: python -m pytest -q tests
+      - name: Conformance vectors match the published suite
+        if: matrix.python == '3.12'
+        run: |
+          curl -fsSL https://skaidb.org/conformance/vectors.json -o /tmp/published.json
+          if ! cmp -s /tmp/published.json conformance/vectors.json; then
+            echo "::error::conformance/vectors.json differs from https://skaidb.org/conformance/vectors.json — copy the published file in and make the tests pass"
+            exit 1
+          fi
       - name: Import check
         run: python -c "import skaidb; print(skaidb.__version__)"
 

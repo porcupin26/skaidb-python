@@ -4,6 +4,35 @@ All notable changes to the skaidb Python driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-09-26
+
+### Added
+- **Automatic reconnect** (`connect(auto_reconnect=True)`, the default): a
+  statement whose connection fails in transit re-dials and runs once more,
+  and a broken connection re-dials before its next statement. Re-dials try
+  the other endpoints before the one that failed — a member going down in a
+  rolling restart used to accept the fresh dial and fail it again, ending a
+  long `executemany` backfill. `executemany` re-prepares on the new
+  connection. At-least-once on failover; `auto_reconnect=False` restores the
+  old behaviour.
+- **Certificate login**: `auth_mechanism="certificate"` with
+  `tls_client_cert` / `tls_client_key` authenticates with the TLS client
+  certificate (wire mechanism EXTERNAL; its Common Name is the user). The default
+  user asserts no name; pass `user` to require a specific Common Name.
+- The shared **wire-protocol conformance suite**
+  (`conformance/vectors.json`, generated from the server's reference
+  encoders and published at https://skaidb.org/conformance/vectors.json)
+  runs in CI through the public API against a fake server that sends the
+  reference bytes. CI also fails when the vendored copy differs from the
+  published one.
+
+### Fixed
+- `Decimal` values wider than 28 digits decoded rounded (the default
+  `decimal` context precision): they are now built exactly from the wire
+  mantissa (up to 38 digits). Caught by the conformance suite.
+- `tls=True` without `tls_ca` now loads the system trust store, as
+  documented; before, the context had no CAs and every verification failed.
+
 ## [1.0.2] - 2026-09-20
 
 1.0.2 — release automation: published from GitHub Actions.
