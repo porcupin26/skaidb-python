@@ -77,7 +77,20 @@ with pool.connection(affinity=user_id) as conn:          # same member
 ```
 
 Checkouts without a key share one pool-wide key, so with constant writes
-everything follows the latest writer — pass a key when you balance. A
+everything follows the latest writer — pass a key when you balance.
+
+Derive the key without touching the pool. If the key comes from something
+that itself queries the database through the same pool — Flask-Login's
+`current_user`, for instance, runs your `user_loader` — a helper that checks
+out a connection and computes the key inside it re-enters itself. Read the
+raw id from the session or token instead:
+
+```python
+from flask import session
+
+def db():
+    return pool.connection(affinity=session.get("_user_id"))  # no query to get the key
+``` A
 statement is a write unless it starts with `SELECT`, `SHOW`, `EXPLAIN`,
 `DESCRIBE`, `VALUES`, `WITH` or `USE`.
 
