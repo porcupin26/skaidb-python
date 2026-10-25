@@ -208,9 +208,11 @@ class Endpoints(unittest.TestCase):
 class _FakeConn:
     """Stand-in connection for pool tests: no socket, controllable health."""
 
-    def __init__(self):
+    def __init__(self, endpoint):
         self.closed = False
         self.broken = False
+        self._connected = endpoint
+        self._pool_ep = None
 
     def is_usable(self):
         return not self.closed and not self.broken
@@ -221,18 +223,16 @@ class _FakeConn:
 
 class Pool(unittest.TestCase):
     def _pool(self):
-        # Patch connect() so the pool mints _FakeConns instead of dialing.
+        # Swap the pool's dialer so it mints _FakeConns instead of dialing.
         self._made = []
 
-        def fake_connect(**kwargs):
-            c = _FakeConn()
+        def fake_dial(order, observer=None, reconnect=None):
+            c = _FakeConn(order[0])
             self._made.append(c)
             return c
 
         p = skaidb.ConnectionPool(maxsize=2)
-        p._orig_connect = skaidb.connect
-        skaidb.connect = fake_connect
-        self.addCleanup(setattr, skaidb, "connect", p._orig_connect)
+        p._dial = fake_dial
         return p
 
     def test_checkout_checkin_reuse(self):

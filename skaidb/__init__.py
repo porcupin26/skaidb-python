@@ -25,11 +25,13 @@ import datetime as _dt
 import decimal
 import hashlib
 import hmac
+import logging
 import random
 import socket
 import ssl
 import struct
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
@@ -39,7 +41,7 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 # the fallback for running straight from a source checkout that was never
 # installed (tests/test_version.py keeps it equal to pyproject.toml). The
 # server records it in its `drivers` table via the Hello frame.
-_FALLBACK_VERSION = "1.1.1"
+_FALLBACK_VERSION = "1.2.0"
 
 
 def _detect_version() -> str:
@@ -482,6 +484,11 @@ class Connection:
     _auto_reconnect = False
     _cert_auth = False
     _connected = None
+    # The pool that owns this connection (see `ConnectionPool`): told each
+    # round trip's latency, each transport failure and each write, and asked
+    # for the dial order when the connection re-dials. None outside a pool.
+    _observer = None
+    _pool_ep = None
 
     def __init__(
         self,
@@ -496,7 +503,9 @@ class Connection:
         tls_server_name="skaidb",
         auto_reconnect=True,
         auth_mechanism="scram",
+        observer=None,
     ):
+        self._observer = observer
         self._consistency = Consistency.resolve(consistency)
         # Re-dial transparently after a transport failure (see `_run`).
         self._auto_reconnect = auto_reconnect
@@ -568,6 +577,8 @@ class Connection:
             except (OSError, OperationalError) as e:
                 errors.append(f"{host}:{port}: {e}")
                 self._drop_socket()
+                if self._observer is not None and _member_fault(e):
+                    self._observer._failed((host, port))
                 continue
             # Connected + authenticated: a fresh socket has no prepared
             # statements, no stream in flight and is not broken.
@@ -621,7 +632,11 @@ class Connection:
         # going down during a rolling restart still accepts a connect for a
         # moment, and re-dialing it first lost the retry (and an 8-hour
         # backfill) in production.
-        if self._connected in self._endpoints and len(self._endpoints) > 1:
+        if self._observer is not None:
+            # Pooled: the pool's current order (healthy members first, the
+            # one that failed last).
+            self._endpoints = self._observer._dial_order(exclude=self._connected)
+        elif self._connected in self._endpoints and len(self._endpoints) > 1:
             self._endpoints.remove(self._connected)
             self._endpoints.append(self._connected)
         self._drop_socket()
@@ -777,6 +792,7 @@ class Connection:
         connection lock. Transport failures surface as `OperationalError` so a
         pool can recycle the connection cleanly."""
         self._check_ready()
+        started = time.monotonic()
         try:
             with self._lock:
                 # Re-check under the lock: `_stream_open` claims the
@@ -785,15 +801,30 @@ class Connection:
                 if self._streaming:
                     raise ProgrammingError(_BUSY_STREAMING)
                 self._write_frame(req)
-                return _Reader(self._read_frame())
+                frame = self._read_frame()
         except OperationalError:
             # A framing-level error (e.g. server closed the socket) leaves the
             # connection unusable; mark it so pools recycle it.
             self._broken = True
+            self._observe_failure()
             raise
         except OSError as e:  # mid-query socket error: dead peer, timeout, ...
             self._broken = True
+            self._observe_failure()
             raise OperationalError(f"query transport failed: {e}") from e
+        if self._observer is not None:
+            self._observer._round_trip(self, time.monotonic() - started)
+        return _Reader(frame)
+
+    def _observe_failure(self) -> None:
+        if self._observer is not None and self._connected is not None:
+            self._observer._failed(self._connected)
+
+    def _note_statement(self, sql: str) -> None:
+        """A statement succeeded: a pool with read-your-writes on remembers
+        which member took a write."""
+        if self._observer is not None and _is_write(sql):
+            self._observer._wrote(self)
 
     def _check_ready(self) -> None:
         """Refuse to start a request on a connection that cannot carry one.
@@ -916,6 +947,7 @@ class Connection:
         body = sql.encode("utf-8")
         req = bytes([_OP_QUERY_STREAM, level]) + struct.pack("<I", len(body)) + body
         r = self._stream_open(req)
+        self._note_statement(sql)
         try:
             tag = r.u8()
             if tag == _RESP_ERROR:
@@ -961,17 +993,23 @@ class Connection:
             if self._streaming:
                 raise ProgrammingError(_BUSY_STREAMING)
             self._streaming = True
+            started = time.monotonic()
             try:
                 self._write_frame(req)
-                return _Reader(self._read_frame())
+                frame = self._read_frame()
             except OperationalError:
                 self._streaming = False
                 self._broken = True
+                self._observe_failure()
                 raise
             except OSError as e:
                 self._streaming = False
                 self._broken = True
+                self._observe_failure()
                 raise OperationalError(f"query transport failed: {e}") from e
+        if self._observer is not None:
+            self._observer._round_trip(self, time.monotonic() - started)
+        return _Reader(frame)
 
     def _stream_release(self) -> None:
         """Give the connection back once a stream's exchange is over."""
@@ -1057,6 +1095,10 @@ class Connection:
         if not self.closed:
             self.closed = True
             self._drop_socket()
+            if self._observer is not None and getattr(self, "_pool_out", False):
+                # Closed while checked out instead of returned: the pool
+                # stops counting it against its member.
+                self._observer._closed_out(self)
 
     def __enter__(self) -> "Connection":
         return self
@@ -1243,6 +1285,7 @@ class Cursor:
             # No parameters: one-shot query. `_bind` still rejects a stray `?`.
             text = _bind(sql, None)
             kind, a, b = conn._run(lambda: conn._query(text, self._consistency))
+        conn._note_statement(sql)
         self._result_sets = []
         if kind == "sets":
             self._result_sets = list(a)
@@ -1268,6 +1311,7 @@ class Cursor:
             self.rowcount = 0
             return
         self.connection._run(lambda: self._executemany_once(sql, rows))
+        self.connection._note_statement(sql)
 
     def _executemany_once(self, sql: str, rows: "list[list[Any]]") -> None:
         # One round-trip for the whole batch via the ExecuteBatch wire op
@@ -1426,22 +1470,59 @@ def connect(
     (its Common Name is the user; the server needs ``auth.x509_enabled``).
     """
     endpoints = _resolve_endpoints(host, port, seeds)
+    _, dial = _dialer(
+        host, port, seeds, user, password, consistency, timeout, database,
+        connect_timeout, read_timeout, tls, tls_ca, tls_insecure, tls_server_name,
+        tls_client_cert, tls_client_key, auth_mechanism, auto_reconnect,
+    )
+    return dial(endpoints)
+
+
+def _dialer(
+    host: str = "localhost",
+    port: int = 7000,
+    seeds: Optional[Sequence[str]] = None,
+    user: str = "anonymous",
+    password: str = "",
+    consistency: "int | str" = Consistency.QUORUM,
+    timeout: Optional[float] = 10.0,
+    database: Optional[str] = None,
+    connect_timeout: Optional[float] = None,
+    read_timeout: Optional[float] = None,
+    tls: bool = False,
+    tls_ca: Optional[str] = None,
+    tls_insecure: bool = False,
+    tls_server_name: str = "skaidb",
+    tls_client_cert: Optional[str] = None,
+    tls_client_key: Optional[str] = None,
+    auth_mechanism: str = "scram",
+    auto_reconnect: bool = True,
+):
+    """The configured endpoints (in the order given) and a function that
+    dials a :class:`Connection` across an explicit endpoint order with
+    :func:`connect`'s options — the TLS context is built once."""
+    endpoints = [_parse_endpoint(s, port) for s in seeds] if seeds else [(host, port)]
     ct = connect_timeout if connect_timeout is not None else timeout
     rt = read_timeout if read_timeout is not None else timeout
     tls_ctx = _build_tls_context(tls, tls_ca, tls_insecure, tls_client_cert, tls_client_key)
-    return Connection(
-        endpoints,
-        user,
-        password,
-        consistency,
-        ct,
-        rt,
-        database,
-        tls_ctx,
-        tls_server_name,
-        auto_reconnect=auto_reconnect,
-        auth_mechanism=auth_mechanism,
-    )
+
+    def dial(order, observer=None, reconnect=None):
+        return Connection(
+            order,
+            user,
+            password,
+            consistency,
+            ct,
+            rt,
+            database,
+            tls_ctx,
+            tls_server_name,
+            auto_reconnect=auto_reconnect if reconnect is None else reconnect,
+            auth_mechanism=auth_mechanism,
+            observer=observer,
+        )
+
+    return endpoints, dial
 
 
 def _build_tls_context(
@@ -1475,66 +1556,277 @@ def _build_tls_context(
 
 # ---- connection pool ------------------------------------------------------
 
+_log = logging.getLogger("skaidb.pool")
+
+# Leading keywords of statements that never write: everything else counts as
+# a write for read-your-writes affinity (a read taken for a write only keeps
+# the caller on its member a little longer).
+_READ_KEYWORDS = frozenset(
+    ("select", "show", "explain", "describe", "desc", "values", "with", "use")
+)
+
+
+def _is_write(sql: str) -> bool:
+    i, n = 0, len(sql)
+    while i < n:
+        if sql[i].isspace() or sql[i] == "(":
+            i += 1
+        elif sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j < 0 else j + 1
+        elif sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        else:
+            break
+    j = i
+    while j < n and (sql[j].isalpha() or sql[j] == "_"):
+        j += 1
+    return sql[i:j].lower() not in _READ_KEYWORDS
+
+
+def _member_fault(e: BaseException) -> bool:
+    """Whether a failed dial says something about the member's health. A
+    refused login is the caller's problem, not the member's — except a
+    capacity refusal, which is the member being full."""
+    msg = str(e)
+    if isinstance(e, OSError):
+        return True
+    if msg.startswith("authentication denied"):
+        return "too many connections:" in msg
+    return not msg.startswith("server signature mismatch")
+
+
+def _ep_text(ep: "Tuple[str, int]") -> str:
+    return f"{ep[0]}:{ep[1]}"
+
+
+# Latency EWMA: each round trip moves a member's average 5% toward it, and no
+# sample counts for more than 10x the larger of the current average and the
+# ejection floor — one slow query does not eject a healthy member, a member
+# that stays slow is ejected within a few dozen statements.
+_EWMA_WEIGHT = 0.05
+_EWMA_CLAMP = 10.0
+# Round trips a member (and at least one other) needs before its average
+# can eject it.
+_EWMA_MIN_SAMPLES = 10
+# least_latency: a member whose last round trip is older than this scores 0,
+# so a lightly loaded pool keeps re-measuring every member instead of
+# settling forever on whichever answered fastest once.
+_STALE_SAMPLE = 2.0
+# How often the background thread checks for members due a re-probe.
+_MAINTAIN_TICK = 0.25
+# Discovery refresh while a listed member is not ready: a member is often
+# `unreachable` or `resyncing` only for seconds (a peer's circuit breaker
+# right after it restarts), and waiting a whole refresh interval to let it
+# back in leaves the load on the others.
+_REFRESH_NOT_READY = 5.0
+
+
+class _Member:
+    """One member as the pool sees it."""
+
+    __slots__ = (
+        "endpoint", "seed", "canonical", "listed", "ewma", "samples", "last_sample", "errors",
+        "ejected_until", "ejections", "readmitted_at", "in_use", "probing",
+    )
+
+    def __init__(self, endpoint: "Tuple[str, int]", seed: bool):
+        self.endpoint = endpoint  # what the pool dials
+        self.seed = seed  # configured: discovery never drops it
+        self.canonical: "str | None" = None  # its own SHOW ENDPOINTS name
+        self.listed = "ready"  # ready | resyncing | unreachable | unlisted
+        self.ewma: "float | None" = None  # seconds
+        self.samples = 0
+        self.last_sample = 0.0
+        self.errors = 0  # consecutive transport failures
+        self.ejected_until: "float | None" = None  # None = admitted
+        self.ejections = 0
+        self.readmitted_at = 0.0
+        self.in_use = 0
+        self.probing = False
+
 
 class ConnectionPool:
-    """A thread-safe pool of skaidb connections.
+    """A thread-safe pool of skaidb connections, balanced across members.
 
     Hands out connections from an idle set (creating new ones up to
     ``maxsize`` retained idle) and validates them cheaply on checkout/checkin,
     discarding any left broken by a transport error. All keyword arguments
     accepted by :func:`connect` (``seeds``, ``database``, timeouts, auth, …)
-    pass straight through, so pooled connections inherit multi-seed failover.
+    pass straight through.
+
+    Load balancing (see docs/pooling.md):
+
+    * ``load_balancing`` — ``"random"`` (default: each new connection dials
+      the members in random order), ``"round_robin"`` (checkouts rotate over
+      the members) or ``"least_latency"`` (of two members picked at random,
+      the one with the lower latency average x checked-out connections).
+    * ``idle_order`` — ``"lifo"`` (default: the most recently returned idle
+      connection first) or ``"fifo"`` (the longest idle first, so every idle
+      connection keeps getting used).
+    * ``discover`` — read the members from ``SHOW ENDPOINTS`` (server >=
+      0.327) when connections are first made to them and every
+      ``refresh_interval`` seconds after: members joining the cluster are
+      added, members the server reports ``resyncing`` or ``unreachable``
+      get no new connections until they are ``ready`` again.
+    * Health ejection: a member with ``eject_errors`` consecutive transport
+      failures, or whose latency average is above ``eject_latency_factor``
+      times the other members' median and at least ``eject_latency_floor``
+      seconds slower, gets no connections for ``eject_backoff`` seconds
+      (doubling per repeat, up to ``eject_backoff_max``), then a background
+      probe re-admits it. The last usable member is never ejected.
+    * ``read_your_writes`` — seconds after a write during which checkouts
+      with the same ``affinity`` key go to the member that took it (the
+      coordinator that acknowledged a write reads it back even at ``ONE``).
+      0 (default) turns it off.
 
     Typical use::
 
-        pool = skaidb.pool(seeds=["h1", "h2", "h3"], database="app", maxsize=8)
+        pool = skaidb.pool(seeds=["h1", "h2", "h3"], database="app", maxsize=8,
+                           load_balancing="least_latency", discover=True)
         with pool.connection() as conn:
             conn.execute("SELECT ...")
     """
 
-    def __init__(self, maxsize: int = 10, **connect_kwargs: Any):
+    def __init__(
+        self,
+        maxsize: int = 10,
+        *,
+        load_balancing: str = "random",
+        idle_order: str = "lifo",
+        discover: bool = False,
+        refresh_interval: float = 60.0,
+        read_your_writes: float = 0.0,
+        eject_errors: int = 3,
+        eject_latency_factor: float = 3.0,
+        eject_latency_floor: float = 0.05,
+        eject_backoff: float = 5.0,
+        eject_backoff_max: float = 60.0,
+        **connect_kwargs: Any,
+    ):
         if maxsize < 1:
             raise ValueError("maxsize must be >= 1")
+        if load_balancing not in ("random", "round_robin", "least_latency"):
+            raise ValueError(
+                f"unknown load_balancing {load_balancing!r} "
+                "(use 'random', 'round_robin' or 'least_latency')"
+            )
+        if idle_order not in ("lifo", "fifo"):
+            raise ValueError(f"unknown idle_order {idle_order!r} (use 'lifo' or 'fifo')")
+        if eject_errors < 1:
+            raise ValueError("eject_errors must be >= 1")
         self._maxsize = maxsize
+        self._policy = load_balancing
+        self._fifo = idle_order == "fifo"
+        self._discover = discover
+        self._refresh_interval = refresh_interval
+        self._ryw = read_your_writes
+        self._eject_errors = eject_errors
+        self._eject_factor = eject_latency_factor
+        self._eject_floor = eject_latency_floor
+        self._backoff = eject_backoff
+        self._backoff_max = eject_backoff_max
         self._kwargs = connect_kwargs
+        seeds, self._dial = _dialer(**connect_kwargs)
+        self._members: "dict[Tuple[str, int], _Member]" = {}
+        for ep in seeds:
+            self._members.setdefault(ep, _Member(ep, seed=True))
         self._idle: List[Connection] = []
         self._lock = threading.Lock()
+        self._rr = -1
+        self._affinity: "dict[Any, Tuple[Tuple[str, int], float]]" = {}
+        self._discovery_off = False
+        self._next_refresh = 0.0
+        self._stop = threading.Event()
+        self._maintainer: "threading.Thread | None" = None
         self.closed = False
 
-    def getconn(self) -> Connection:
-        """Check out a usable connection, reusing an idle one when possible."""
+    # -- checkout / checkin --
+
+    def getconn(self, affinity: Any = None) -> Connection:
+        """Check out a usable connection: an idle one to the member the
+        policy picks, or a new one dialed to it (falling back to the other
+        members). ``affinity`` scopes read-your-writes (None = pool-wide)."""
         while True:
             with self._lock:
                 if self.closed:
                     raise ProgrammingError("pool is closed")
-                conn = self._idle.pop() if self._idle else None
+                target = self._pick(affinity)
+                conn, stale = self._take_idle(target)
+                order = None if conn is not None else self._order(first=target)
+            for c in stale:
+                c.close()
             if conn is None:
-                return connect(**self._kwargs)
-            if conn.is_usable():
-                return conn
-            conn.close()  # discard a stale idle connection, then loop
+                conn = self._dial(order, observer=self)
+                conn._pool_ep = conn._connected
+                self._discover_through(conn)
+                if not conn.is_usable():
+                    conn.close()
+                    continue
+            elif not conn.is_usable():
+                conn.close()  # discard a stale idle connection, then loop
+                continue
+            with self._lock:
+                m = self._members.get(conn._pool_ep)
+                if m is not None:
+                    m.in_use += 1
+            conn._pool_affinity = affinity
+            conn._pool_out = True
+            return conn
 
     def putconn(self, conn: Connection) -> None:
-        """Return a connection to the pool, or close it if it is broken or the
-        pool is full."""
+        """Return a connection to the pool, or close it if it is broken, its
+        member is ejected or gone, or the pool is full."""
         with self._lock:
-            if not self.closed and conn.is_usable() and len(self._idle) < self._maxsize:
+            m = self._members.get(conn._pool_ep)
+            if getattr(conn, "_pool_out", False):
+                conn._pool_out = False
+                if m is not None and m.in_use > 0:
+                    m.in_use -= 1
+            if (
+                not self.closed
+                and conn.is_usable()
+                and m is not None
+                and self._usable(m)
+                and len(self._idle) < self._maxsize
+            ):
                 self._idle.append(conn)
                 return
         conn.close()
 
     @contextmanager
-    def connection(self):
+    def connection(self, affinity: Any = None):
         """Context manager: check out a connection and return it on exit
         (closing it instead if a transport error broke it)."""
-        conn = self.getconn()
+        conn = self.getconn(affinity)
         try:
             yield conn
         finally:
-            if conn.is_usable():
-                self.putconn(conn)
-            else:
-                conn.close()
+            self.putconn(conn)
+
+    def members(self) -> "list[dict]":
+        """The members as the pool sees them, for monitoring: ``endpoint``,
+        ``canonical`` (the member's own name, once discovered), ``state``
+        (``ready``, ``ejected``, ``resyncing``, ``unreachable``, ``unlisted``),
+        ``latency_ms`` (the round-trip average), ``in_use``, ``idle``,
+        ``seed``."""
+        with self._lock:
+            idle: "dict[Tuple[str, int], int]" = {}
+            for c in self._idle:
+                idle[c._pool_ep] = idle.get(c._pool_ep, 0) + 1
+            return [
+                {
+                    "endpoint": _ep_text(m.endpoint),
+                    "canonical": m.canonical,
+                    "state": "ejected" if m.ejected_until is not None else m.listed,
+                    "latency_ms": None if m.ewma is None else m.ewma * 1000.0,
+                    "in_use": m.in_use,
+                    "idle": idle.get(m.endpoint, 0),
+                    "seed": m.seed,
+                }
+                for m in sorted(self._members.values(), key=lambda m: m.endpoint)
+            ]
 
     def close(self) -> None:
         """Close the pool and every idle connection. Checked-out connections
@@ -1542,6 +1834,7 @@ class ConnectionPool:
         with self._lock:
             self.closed = True
             idle, self._idle = self._idle, []
+        self._stop.set()
         for conn in idle:
             conn.close()
 
@@ -1551,8 +1844,334 @@ class ConnectionPool:
     def __exit__(self, *exc) -> None:
         self.close()
 
+    # -- choosing a member (callers hold self._lock) --
 
-def pool(maxsize: int = 10, **connect_kwargs: Any) -> ConnectionPool:
+    @staticmethod
+    def _usable(m: _Member) -> bool:
+        return m.ejected_until is None and m.listed == "ready"
+
+    def _pick(self, affinity: Any) -> "_Member | None":
+        """The member this checkout should go to, or None for "any" (the
+        random policy, or no usable member at all)."""
+        if self._ryw > 0:
+            hit = self._affinity.get(affinity)
+            if hit is not None:
+                ep, until = hit
+                m = self._members.get(ep)
+                if time.monotonic() >= until or m is None:
+                    del self._affinity[affinity]
+                elif self._usable(m):
+                    return m
+        usable = [m for m in self._members.values() if self._usable(m)]
+        if not usable or self._policy == "random":
+            return None
+        if self._policy == "round_robin":
+            usable.sort(key=lambda m: m.endpoint)
+            self._rr = (self._rr + 1) % len(usable)
+            return usable[self._rr]
+        if len(usable) == 1:
+            return usable[0]
+        a, b = random.sample(usable, 2)
+        return a if self._score(a) <= self._score(b) else b
+
+    @staticmethod
+    def _score(m: _Member) -> float:
+        # A member never measured, or not lately, scores 0: it is tried and
+        # measured.
+        if m.ewma is None or time.monotonic() - m.last_sample > _STALE_SAMPLE:
+            return 0.0
+        return m.ewma * (m.in_use + 1)
+
+    def _take_idle(self, target: "_Member | None"):
+        """Remove and return an idle connection (to `target`, or to any
+        usable member), plus the idle connections found to belong to members
+        that are no longer usable (to close outside the lock)."""
+        stale = []
+        found = None
+        idx = range(len(self._idle)) if self._fifo else range(len(self._idle) - 1, -1, -1)
+        for i in idx:
+            c = self._idle[i]
+            m = self._members.get(c._pool_ep)
+            if m is None or not self._usable(m):
+                stale.append(i)
+                continue
+            if target is None or m is target:
+                found = i
+                break
+        picked = self._idle[found] if found is not None else None
+        drop = set(stale)
+        if found is not None:
+            drop.add(found)
+        stale_conns = [self._idle[i] for i in stale]
+        if drop:
+            self._idle = [c for i, c in enumerate(self._idle) if i not in drop]
+        return picked, stale_conns
+
+    def _order(self, first: "_Member | None" = None, exclude=None) -> "List[Tuple[str, int]]":
+        """Endpoints to dial, best first: `first`, the other usable members
+        in random order, then the rest (resyncing/unreachable before
+        ejected, soonest re-admission first) — a dial never has nowhere to
+        go while any member is configured."""
+        usable = [m for m in self._members.values() if self._usable(m) and m is not first]
+        random.shuffle(usable)
+        rest = [m for m in self._members.values() if not self._usable(m) and m is not first]
+        rest.sort(key=lambda m: (m.ejected_until is not None, m.ejected_until or 0.0))
+        order = ([first] if first is not None else []) + usable + rest
+        eps = [m.endpoint for m in order]
+        if exclude in eps and len(eps) > 1:
+            eps.remove(exclude)
+            eps.append(exclude)
+        return eps
+
+    # -- what connections report (any thread) --
+
+    def _dial_order(self, exclude=None) -> "List[Tuple[str, int]]":
+        """A pooled connection re-dialing: the pool's order, the member it
+        lost last."""
+        with self._lock:
+            return self._order(None, exclude)
+
+    def _round_trip(self, conn: Connection, elapsed: float) -> None:
+        with self._lock:
+            ep = conn._connected
+            if ep != conn._pool_ep:
+                # The connection re-dialed to another member mid-checkout.
+                old = self._members.get(conn._pool_ep)
+                if getattr(conn, "_pool_out", False):
+                    if old is not None and old.in_use > 0:
+                        old.in_use -= 1
+                    new = self._members.get(ep)
+                    if new is not None:
+                        new.in_use += 1
+                conn._pool_ep = ep
+            m = self._members.get(ep)
+            if m is None:
+                return
+            m.errors = 0
+            if m.ewma is None:
+                m.ewma = elapsed
+            else:
+                cap = _EWMA_CLAMP * max(m.ewma, self._eject_floor)
+                m.ewma += _EWMA_WEIGHT * (min(elapsed, cap) - m.ewma)
+            m.samples += 1
+            m.last_sample = time.monotonic()
+            # Only an admitted member can be ejected for its latency: round
+            # trips still finishing on connections checked out before an
+            # ejection must not eject it again (and double its backoff).
+            if self._usable(m) and m.samples >= _EWMA_MIN_SAMPLES and self._eject_factor > 0:
+                others = sorted(
+                    o.ewma
+                    for o in self._members.values()
+                    if o is not m and self._usable(o) and o.ewma is not None
+                    and o.samples >= _EWMA_MIN_SAMPLES
+                )
+                if others:
+                    median = others[(len(others) - 1) // 2]
+                    if m.ewma > self._eject_factor * median and m.ewma - median > self._eject_floor:
+                        self._eject(m, f"latency {m.ewma * 1000:.1f} ms vs median {median * 1000:.1f} ms")
+
+    def _failed(self, ep: "Tuple[str, int]") -> None:
+        with self._lock:
+            m = self._members.get(ep)
+            if m is None:
+                return
+            m.errors += 1
+            if m.errors >= self._eject_errors and m.ejected_until is None:
+                self._eject(m, f"{m.errors} consecutive connection failures")
+
+    def _closed_out(self, conn: Connection) -> None:
+        with self._lock:
+            if getattr(conn, "_pool_out", False):
+                conn._pool_out = False
+                m = self._members.get(conn._pool_ep)
+                if m is not None and m.in_use > 0:
+                    m.in_use -= 1
+
+    def _wrote(self, conn: Connection) -> None:
+        if self._ryw <= 0 or not getattr(conn, "_pool_out", False):
+            return
+        now = time.monotonic()
+        with self._lock:
+            if len(self._affinity) >= 4096:
+                self._affinity = {k: v for k, v in self._affinity.items() if v[1] > now}
+            self._affinity[getattr(conn, "_pool_affinity", None)] = (conn._connected, now + self._ryw)
+
+    # -- ejection and re-admission --
+
+    def _eject(self, m: _Member, why: str) -> None:
+        """Take `m` out of rotation (caller holds the lock) — unless it is
+        the last usable member: a slow or flaky member beats none."""
+        if not any(self._usable(o) for o in self._members.values() if o is not m):
+            return
+        now = time.monotonic()
+        if now - m.readmitted_at > self._backoff_max:
+            m.ejections = 0  # healthy for a while: start the backoff over
+        m.ejections += 1
+        m.ejected_until = now + self._backoff_for(m)
+        _log.warning("skaidb pool: ejecting %s (%s)", _ep_text(m.endpoint), why)
+        self._ensure_maintainer()
+
+    def _backoff_for(self, m: _Member) -> float:
+        return min(self._backoff * (2 ** max(m.ejections - 1, 0)), self._backoff_max)
+
+    def _ensure_maintainer(self) -> None:
+        """Start the background thread (caller holds the lock): it re-probes
+        ejected members and refreshes discovery. A daemon, so it never holds
+        the interpreter open."""
+        if self._maintainer is None and not self.closed:
+            t = threading.Thread(target=self._maintain, name="skaidb-pool", daemon=True)
+            self._maintainer = t
+            t.start()
+
+    def _maintain(self) -> None:
+        while not self._stop.wait(_MAINTAIN_TICK):
+            now = time.monotonic()
+            with self._lock:
+                due = [
+                    m for m in self._members.values()
+                    if m.ejected_until is not None and now >= m.ejected_until and not m.probing
+                ]
+                for m in due:
+                    m.probing = True
+                refresh = self._discover and not self._discovery_off and now >= self._next_refresh
+            for m in due:
+                self._probe(m)
+            if refresh:
+                self._refresh()
+
+    def _probe(self, m: _Member) -> None:
+        """Dial `m` alone and run one statement: success re-admits it (the
+        probe connection joins the idle set), failure ejects it again for
+        twice as long."""
+        conn = None
+        ok = False
+        try:
+            conn = self._dial([m.endpoint], reconnect=False)
+            ok = conn.ping()
+        except Error:
+            ok = False
+        with self._lock:
+            m.probing = False
+            if self.closed:
+                ok = False
+            elif ok:
+                m.ejected_until = None
+                m.errors = 0
+                m.ewma = None
+                m.samples = 0
+                m.readmitted_at = time.monotonic()
+                _log.warning("skaidb pool: re-admitted %s", _ep_text(m.endpoint))
+                if conn is not None and len(self._idle) < self._maxsize:
+                    conn._observer = self
+                    conn._pool_ep = m.endpoint
+                    conn._auto_reconnect = self._kwargs.get("auto_reconnect", True)
+                    self._idle.append(conn)
+                    conn = None
+            else:
+                m.ejections += 1
+                m.ejected_until = time.monotonic() + self._backoff_for(m)
+        if conn is not None:
+            conn.close()
+
+    # -- discovery --
+
+    def _discover_through(self, conn: Connection) -> None:
+        """Run discovery on a freshly dialed connection when the member it
+        reached has not named itself yet (once per member, so seeds given as
+        host names are matched to the endpoints the server reports)."""
+        if not self._discover or self._discovery_off:
+            return
+        with self._lock:
+            m = self._members.get(conn._pool_ep)
+            if m is None or m.canonical is not None:
+                return
+            self._ensure_maintainer()
+        self._list_through(conn)
+
+    def _refresh(self) -> None:
+        try:
+            conn = self.getconn()
+        except Error:
+            with self._lock:
+                self._next_refresh = time.monotonic() + self._refresh_interval
+            return
+        try:
+            self._list_through(conn)
+        finally:
+            self.putconn(conn)
+
+    def _list_through(self, conn: Connection) -> None:
+        try:
+            cur = conn.cursor()
+            cur.execute("SHOW ENDPOINTS")
+            rows = cur.fetchall()
+        except ProgrammingError:
+            # A server that predates the statement: keep the seeds.
+            with self._lock:
+                self._discovery_off = True
+            return
+        except Error:
+            return
+        with self._lock:
+            if not rows:
+                # A standalone server (or a witness): there are no members to
+                # learn, now or later — keep the seeds and stop asking.
+                self._discovery_off = True
+                return
+            self._apply_listing(conn._pool_ep, rows)
+            interval = self._refresh_interval
+            if any(m.listed in ("resyncing", "unreachable") for m in self._members.values()):
+                interval = min(interval, _REFRESH_NOT_READY)
+            self._next_refresh = time.monotonic() + interval
+
+    def _apply_listing(self, dialed: "Tuple[str, int]", rows) -> None:
+        """Fold a non-empty `SHOW ENDPOINTS` answer (caller holds the lock)."""
+        listed = {}
+        for endpoint, state, local in rows:
+            listed[endpoint] = state
+            if local:
+                me = self._members.get(dialed)
+                if me is not None:
+                    me.canonical = endpoint
+        # A member reported under the name of one already known (a seed
+        # given as a host name) is that member, not a new one.
+        by_name: "dict[str, _Member]" = {}
+        for m in self._members.values():
+            if m.canonical is not None and (m.canonical not in by_name or m.seed):
+                by_name[m.canonical] = m
+        for key, m in list(self._members.items()):
+            if m.canonical is not None and by_name.get(m.canonical) is not m:
+                del self._members[key]  # a duplicate of a seed
+        port = self._kwargs.get("port", 7000)
+        seen = set()
+        for endpoint, state in listed.items():
+            m = by_name.get(endpoint)
+            if m is None:
+                ep = _parse_endpoint(endpoint, port)
+                m = self._members.get(ep)
+                if m is None:
+                    m = _Member(ep, seed=False)
+                    self._members[ep] = m
+                m.canonical = endpoint
+            state = state if state in ("ready", "resyncing", "unreachable") else "ready"
+            if state == "ready" and m.listed != "ready":
+                # Back in rotation: measured afresh, like a re-admission.
+                m.ewma = None
+                m.samples = 0
+                m.errors = 0
+            m.listed = state
+            seen.add(id(m))
+        for key, m in list(self._members.items()):
+            if id(m) in seen or (m.seed and m.canonical is None):
+                continue  # listed, or a seed not identified yet
+            if m.seed:
+                m.listed = "unlisted"  # configured, but no longer a member
+            else:
+                del self._members[key]
+
+
+def pool(maxsize: int = 10, **kwargs: Any) -> ConnectionPool:
     """Create a :class:`ConnectionPool`. Accepts every :func:`connect`
-    keyword (``seeds``, ``database``, timeouts, auth, …)."""
-    return ConnectionPool(maxsize=maxsize, **connect_kwargs)
+    keyword (``seeds``, ``database``, timeouts, auth, …) and the pool's
+    load-balancing options."""
+    return ConnectionPool(maxsize=maxsize, **kwargs)

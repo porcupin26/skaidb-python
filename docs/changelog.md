@@ -21,6 +21,13 @@ literal in `skaidb/__init__.py`), add the `## [X.Y.Z]` section to
 The `Publish to PyPI` workflow runs the tests, builds the sdist and wheel,
 uploads them to PyPI and creates the GitHub Release; nothing is done by hand.
 
+## 1.2.0 — 2026-10-25
+
+Pool load balancing across members: round-robin and least-latency policies,
+FIFO idle order, health ejection with background re-probe, member discovery
+from `SHOW ENDPOINTS`, and read-your-writes affinity.
+[`CHANGELOG.md`](../CHANGELOG.md#120---2026-10-25).
+
 ## 1.1.1 — 2026-09-26
 
 Documentation fix: what the automatic-reconnect retry can apply twice (a

@@ -21,22 +21,83 @@ pool.close()
 ## API
 
 ```python
-skaidb.pool(maxsize: int = 10, **connect_kwargs) -> ConnectionPool
-ConnectionPool.connection()          # context manager: getconn() / putconn()
-ConnectionPool.getconn() -> Connection
+skaidb.pool(maxsize: int = 10, **kwargs) -> ConnectionPool
+ConnectionPool.connection(affinity=None)  # context manager: getconn() / putconn()
+ConnectionPool.getconn(affinity=None) -> Connection
 ConnectionPool.putconn(conn) -> None
+ConnectionPool.members() -> list[dict]
 ConnectionPool.close() -> None
 ConnectionPool.closed: bool
 ```
 
-`connect_kwargs` are exactly the keywords of `connect()`; every new
-connection is dialed with them, so pooled connections inherit multi-seed
-failover, `database=`, timeouts, TLS and the default consistency.
+`kwargs` are the keywords of `connect()` plus the balancing options below;
+every new connection is dialed with the `connect()` ones, so pooled
+connections inherit `database=`, timeouts, TLS, the default consistency and
+automatic reconnect (a pooled connection re-dials in the pool's order:
+usable members first, the one it lost last).
+
+## Balancing across members
+
+By default (`load_balancing="random"`) each new connection dials the seeds in
+random order and stays on the member it reached — fine for many clients, but
+one process can end up with most of its connections on one member. Pick a
+policy to spread a single process's load:
+
+```python
+pool = skaidb.pool(
+    seeds=["db1", "db2", "db3"], database="app", user="app", password=pw,
+    load_balancing="least_latency",  # or "round_robin"
+    discover=True,                   # learn members from the cluster
+    read_your_writes=2.0,            # seconds; see below
+    idle_order="fifo",
+)
+```
+
+| Option | Default | What it does |
+|---|---|---|
+| `load_balancing` | `"random"` | `"round_robin"`: checkouts rotate over the usable members. `"least_latency"`: of two members picked at random, the one with the lower round-trip average × checked-out connections (near and idle members win). |
+| `idle_order` | `"lifo"` | `"fifo"` hands out the longest-idle connection first, so every idle connection keeps being used. |
+| `discover` | `False` | Reads the members with `SHOW ENDPOINTS` (server ≥ 0.327; no privilege needed) when a member is first reached and every `refresh_interval` (60 s) after. New members are added, members that left are dropped (seeds are kept, marked `unlisted`), and members the server reports `resyncing` or `unreachable` get no new connections until they are `ready`. An older or standalone server leaves the seeds as they are. |
+| `eject_errors` | `3` | Consecutive transport failures (dial, I/O, timeout, capacity refusal) that eject a member. Statement errors and refused logins do not count. |
+| `eject_latency_factor`, `eject_latency_floor` | `3.0`, `0.05` | A member whose round-trip average is above factor × the other members' median **and** more than floor seconds above it is ejected (after 10 samples on it and on another member). `0` disables. |
+| `eject_backoff`, `eject_backoff_max` | `5.0`, `60.0` | How long an ejection lasts, doubling per repeat. Afterwards a background thread probes the member and re-admits it. The last usable member is never ejected. |
+| `read_your_writes` | `0.0` | Seconds after a write during which checkouts with the same `affinity` go to the member that took the write. |
+
+**Read-your-writes.** The member that coordinated a write reads it back at
+any consistency, `ONE` included; another member may not have applied it yet.
+With `read_your_writes` set, pass an affinity key — a user or session id —
+when you check out:
+
+```python
+with pool.connection(affinity=user_id) as conn:
+    conn.execute("INSERT INTO notes (id, owner, body) VALUES (?, ?, ?)", (nid, user_id, body))
+# ... the next request for the same user, within the window:
+with pool.connection(affinity=user_id) as conn:          # same member
+    conn.cursor().execute("SELECT body FROM notes WHERE id = ?", (nid,))
+```
+
+Checkouts without a key share one pool-wide key, so with constant writes
+everything follows the latest writer — pass a key when you balance. A
+statement is a write unless it starts with `SELECT`, `SHOW`, `EXPLAIN`,
+`DESCRIBE`, `VALUES`, `WITH` or `USE`.
+
+**Watching it.** `pool.members()` returns one dict per member:
+
+```python
+[{'endpoint': 'db1:7000', 'canonical': '10.0.0.1:7000', 'state': 'ready',
+  'latency_ms': 0.8, 'in_use': 2, 'idle': 3, 'seed': True}, ...]
+```
+
+`state` is `ready`, `ejected`, `resyncing`, `unreachable` or `unlisted`.
+Ejections and re-admissions are logged at WARNING on the `skaidb.pool`
+logger. The rules are the same in every skaidb driver
+([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members)).
 
 ## How it behaves
 
-- **Checkout never blocks.** `getconn()` pops an idle connection if there is
-  one; otherwise it dials a new one. `maxsize` is the cap on **idle**
+- **Checkout never blocks.** `getconn()` takes an idle connection (to the
+  member the policy picks, if it picks one) when there is one; otherwise it
+  dials a new one. `maxsize` is the cap on **idle**
   connections retained, not on concurrent checkouts: with 20 threads and
   `maxsize=8`, up to 20 connections can be open at once and 12 of them are
   closed as they come back. Size `maxsize` to your steady-state concurrency.
@@ -57,7 +118,8 @@ failover, `database=`, timeouts, TLS and the default consistency.
 - **Closing.** `pool.close()` closes every idle connection and marks the pool
   closed; `getconn()` then raises `ProgrammingError`. Connections still
   checked out are closed when they are returned.
-- **Thread safety.** The idle list is guarded by a lock. Connections handed
+- **Thread safety.** The idle list and the member table are guarded by a
+  lock; the probe/discovery thread is a daemon started on first need. Connections handed
   out are exclusively the caller's until returned.
 
 ## Streams and the pool

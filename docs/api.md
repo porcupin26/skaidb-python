@@ -255,20 +255,39 @@ with conn.stream(sql) as rows: ...  # close() on exit
 ## `ConnectionPool` and `pool()`
 
 ```python
-skaidb.pool(maxsize: int = 10, **connect_kwargs) -> ConnectionPool
-skaidb.ConnectionPool(maxsize: int = 10, **connect_kwargs)
+skaidb.pool(maxsize: int = 10, **kwargs) -> ConnectionPool
+skaidb.ConnectionPool(
+    maxsize: int = 10,
+    *,
+    load_balancing: str = "random",       # "random" | "round_robin" | "least_latency"
+    idle_order: str = "lifo",             # "lifo" | "fifo"
+    discover: bool = False,               # read members from SHOW ENDPOINTS
+    refresh_interval: float = 60.0,       # seconds between discovery refreshes
+    read_your_writes: float = 0.0,        # seconds; 0 = off
+    eject_errors: int = 3,                # consecutive transport failures
+    eject_latency_factor: float = 3.0,    # x the other members' median; 0 = off
+    eject_latency_floor: float = 0.05,    # seconds above the median, at least
+    eject_backoff: float = 5.0,           # first ejection, doubling per repeat
+    eject_backoff_max: float = 60.0,
+    **connect_kwargs,
+)
 
-ConnectionPool.getconn() -> Connection
+ConnectionPool.getconn(affinity=None) -> Connection
 ConnectionPool.putconn(conn: Connection) -> None
-ConnectionPool.connection()            # context manager yielding a Connection
+ConnectionPool.connection(affinity=None)   # context manager yielding a Connection
+ConnectionPool.members() -> list[dict]     # endpoint, canonical, state, latency_ms,
+                                           # in_use, idle, seed
 ConnectionPool.close() -> None
 ConnectionPool.closed: bool
 ```
 
-Thread-safe. `connect_kwargs` are passed to `connect()` verbatim for every
-new connection. `maxsize` (`ValueError` if `< 1`) is the cap on **idle**
-connections kept; it does not bound concurrent checkouts and `getconn()`
-never blocks. See [pooling.md](pooling.md).
+Thread-safe. `connect_kwargs` are `connect()`'s keywords; `host`/`port`/
+`seeds` name the starting members and the rest apply to every connection.
+`maxsize` (`ValueError` if `< 1`) is the cap on **idle** connections kept;
+it does not bound concurrent checkouts and `getconn()` never blocks. An
+unknown `load_balancing` or `idle_order` raises `ValueError`. `affinity`
+scopes `read_your_writes` (any hashable; `None` = pool-wide). See
+[pooling.md](pooling.md).
 
 ## `Consistency`
 

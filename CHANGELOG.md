@@ -4,6 +4,27 @@ All notable changes to the skaidb Python driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-10-25
+
+### Added
+- **Pool load balancing across members** (the rules every skaidb driver
+  shares, PROTOCOL.md §6.1): `load_balancing="round_robin"` /
+  `"least_latency"` (power of two choices on the round-trip average ×
+  checked-out connections; `"random"` stays the default), `idle_order="fifo"`,
+  health ejection (consecutive transport failures, or a latency average far
+  above the other members') with a background probe that re-admits the
+  member, `discover=True` (members from `SHOW ENDPOINTS`, server ≥ 0.327:
+  joiners added, leavers dropped, resyncing/unreachable members skipped), and
+  `read_your_writes=<seconds>` with `getconn(affinity=key)` /
+  `connection(affinity=key)` — reads follow the member that took the key's
+  last write. `pool.members()` reports each member's state, latency and
+  connections.
+
+### Changed
+- A pooled connection that re-dials does so in the pool's order (usable
+  members first, the one it lost last), and the pool builds the TLS context
+  once instead of per connection.
+
 ## [1.1.1] - 2026-09-26
 
 ### Fixed

@@ -325,7 +325,12 @@ conn = pool.getconn(); ...; pool.putconn(conn)   # the explicit form
 pool.close()                             # closes idle connections
 ```
 
-`ConnectionPool` is thread-safe and accepts every `connect()` keyword.
+`ConnectionPool` is thread-safe and accepts every `connect()` keyword, plus
+load balancing across members: `load_balancing="round_robin"` or
+`"least_latency"`, `discover=True` (members from `SHOW ENDPOINTS`, resyncing
+ones skipped), health ejection with background re-probe, `idle_order="fifo"`
+and `read_your_writes=<seconds>` with `pool.connection(affinity=key)`;
+`pool.members()` shows what it sees.
 `maxsize` bounds the number of **idle** connections retained; checkout never
 blocks — when no idle connection is available a new one is dialed, and a
 returned connection beyond `maxsize` is closed. Connections are validated with
