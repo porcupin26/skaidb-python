@@ -4,6 +4,17 @@ All notable changes to the skaidb Python driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-10-29
+
+### Added
+- **Parameterised streaming**: `conn.stream(sql, params)` binds `?`
+  placeholders exactly as `Cursor.execute(sql, params)` does, over
+  `OP_QUERY_STREAM_PARAMS` (server >= 0.330) — a range-bounded export no
+  longer needs its literals interpolated into the SQL. Without parameters
+  the request is the original `OP_QUERY_STREAM`, so it works against every
+  server; `stream(sql, "ONE")` (a consistency passed positionally) still
+  means the consistency.
+
 ## [1.2.0] - 2026-10-25
 
 ### Added

@@ -135,6 +135,41 @@ class Streaming(unittest.TestCase):
         self.assertEqual(conn._sock.sent[4], skaidb._OP_QUERY_STREAM)
         self.assertEqual(conn._sock.sent[5], skaidb.Consistency.ONE)
 
+    def test_params_travel_in_the_parameterised_opcode(self):
+        conn = _StreamConn().feed(_f_header(["id"]), _f_chunk([(7,)]), _f_end())
+        rows = list(conn.stream("SELECT id FROM t WHERE ts >= ? AND tag = ?", (5, "a")))
+        self.assertEqual(rows, [(7,)])
+        sent = bytes(conn._sock.sent[4:])
+        self.assertEqual(sent[0], skaidb._OP_QUERY_STREAM_PARAMS)
+        self.assertEqual(sent[1], skaidb.Consistency.QUORUM)
+        sql = b"SELECT id FROM t WHERE ts >= ? AND tag = ?"
+        self.assertEqual(sent[2:6], struct.pack("<I", len(sql)))
+        self.assertEqual(sent[6 : 6 + len(sql)], sql)
+        tail = sent[6 + len(sql) :]
+        expect = struct.pack("<H", 2)
+        for v in (5, "a"):
+            vb = _encode_value(v)
+            expect += struct.pack("<I", len(vb)) + vb
+        self.assertEqual(tail, expect, "the same parameter vector OP_EXECUTE carries")
+
+    def test_no_params_keep_the_original_opcode(self):
+        conn = _StreamConn().feed(_f_header([]), _f_end())
+        list(conn.stream("SELECT 1", []))
+        self.assertEqual(conn._sock.sent[4], skaidb._OP_QUERY_STREAM)
+
+    def test_positional_consistency_still_means_consistency(self):
+        conn = _StreamConn().feed(_f_header([]), _f_end())
+        list(conn.stream("SELECT 1", "ONE"))
+        self.assertEqual(conn._sock.sent[4], skaidb._OP_QUERY_STREAM)
+        self.assertEqual(conn._sock.sent[5], skaidb.Consistency.ONE)
+
+    def test_an_old_server_refusing_parameterised_streams_says_so(self):
+        conn = _StreamConn().feed(_f_error("protocol error: malformed message: unknown opcode"))
+        with self.assertRaises(skaidb.ProgrammingError) as cm:
+            conn.stream("SELECT id FROM t WHERE id > ?", (1,))
+        self.assertIn("parameterised streaming", str(cm.exception))
+        self.assertTrue(conn.is_usable(), "a refused request leaves the connection usable")
+
     def test_abandoned_stream_is_drained_and_connection_resyncs(self):
         conn = _StreamConn().feed(
             _f_header(["id"]),

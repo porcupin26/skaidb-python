@@ -4,8 +4,10 @@
 memory. `Connection.stream()` receives it in chunks and holds one chunk at a
 time. Use it for exports, scans and any result that might not fit in memory
 — it is also how you read a large table without tripping the server's
-per-statement scan budgets, since the server executes an eligible `SELECT`
-page by page.
+per-statement scan budgets: the server executes a plain `SELECT` page by
+page, and no scan budget applies to a streamed page (server >= 0.330 — the
+rules are in the server's QUERY_SYNTAX.md, "Streamed queries", and `EXPLAIN`
+says which statements page).
 
 ```python
 with conn.stream("SELECT id, pad FROM big ORDER BY id") as rows:
@@ -51,7 +53,7 @@ the first N rows — then the drain is short and the connection survives.
 ## What you get back
 
 ```python
-rows = conn.stream(sql, consistency=None)
+rows = conn.stream(sql, params=None, consistency=None)
 ```
 
 | Statement produced | Result |
@@ -63,9 +65,19 @@ rows = conn.stream(sql, consistency=None)
 | a `CALL` returning several result sets | `InterfaceError` from `stream()`; connection stays usable — use `execute()` + `nextset()` |
 | server without the streaming opcode | `ProgrammingError("server does not support streaming: …")` |
 
-`stream()` takes SQL text only; there is no parameter binding on the
-streaming opcode. Bind values yourself with care or restructure the query
-(for example `WHERE id IN (...)` with a literal list).
+`params` bind the statement's `?` placeholders, typed, exactly as
+`Cursor.execute(sql, params)` binds them:
+
+```python
+with conn.stream("SELECT id, ts, body FROM events WHERE ts >= ? AND ts < ?", (start, end)) as rows:
+    for row in rows:
+        ...
+```
+
+They travel in `OP_QUERY_STREAM_PARAMS`, which needs a server >= 0.330 (an
+older one answers `ProgrammingError("server does not support parameterised
+streaming …")`); a stream without parameters sends the original opcode and
+works against every server.
 
 ## Errors mid-stream
 

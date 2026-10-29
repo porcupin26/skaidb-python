@@ -41,7 +41,7 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 # the fallback for running straight from a source checkout that was never
 # installed (tests/test_version.py keeps it equal to pyproject.toml). The
 # server records it in its `drivers` table via the Hello frame.
-_FALLBACK_VERSION = "1.2.0"
+_FALLBACK_VERSION = "1.3.0"
 
 
 def _detect_version() -> str:
@@ -315,6 +315,7 @@ _OP_CLOSE = 4
 _OP_EXECUTE_BATCH = 7
 _OP_QUERY_STREAM = 5
 _OP_HELLO = 8
+_OP_QUERY_STREAM_PARAMS = 9
 
 _RESP_ROWS = 0
 _RESP_MUTATION = 1
@@ -915,10 +916,28 @@ class Connection:
         except (OperationalError, ProgrammingError, InterfaceError):
             pass
 
-    def stream(self, sql: str, consistency: "int | None" = None) -> "RowStream":
+    def stream(
+        self,
+        sql: str,
+        params: "Optional[Sequence[Any]]" = None,
+        consistency: "int | str | None" = None,
+    ) -> "RowStream":
         """Run `sql` over `OP_QUERY_STREAM` and return a :class:`RowStream` —
         an iterator of rows that holds one chunk at a time instead of the
         whole result, for exports and large scans.
+
+        `params` bind the statement's ``?`` placeholders in order — typed,
+        exactly the values `Cursor.execute` takes (lists, dicts, datetimes,
+        …) — over `OP_QUERY_STREAM_PARAMS` (servers >= 0.330)::
+
+            for row in conn.stream("SELECT id, ts FROM events WHERE ts >= ?", (since,)):
+                ...
+
+        Without parameters the request is the original `OP_QUERY_STREAM`, so
+        a parameterless stream works against every server; a parameterised
+        one against an older server raises `ProgrammingError`. (A
+        consistency passed positionally, ``stream(sql, "ONE")`` — the
+        signature before `params` existed — still means the consistency.)
 
         The connection is busy for the whole stream: every other statement on
         it raises `ProgrammingError` until the stream finishes. It finishes
@@ -936,16 +955,30 @@ class Connection:
                     if enough(row):
                         break
 
-        Takes no parameters: the streaming opcode carries SQL text. Raises
-        `ProgrammingError` against a server that does not know the opcode.
+        Raises `ProgrammingError` against a server that does not know the
+        opcode.
         """
+        if consistency is None and isinstance(params, (int, str)):
+            # `stream(sql, consistency)`, written before `params` existed.
+            consistency, params = params, None
         level = (
             self._consistency
             if consistency is None
             else Consistency.resolve(consistency)
         )
         body = sql.encode("utf-8")
-        req = bytes([_OP_QUERY_STREAM, level]) + struct.pack("<I", len(body)) + body
+        params = list(params) if params else []
+        if params:
+            req = bytearray([_OP_QUERY_STREAM_PARAMS, level])
+            req += struct.pack("<I", len(body)) + body
+            req += struct.pack("<H", len(params))
+            for p in params:
+                vb = _encode_value(p)
+                req += struct.pack("<I", len(vb))
+                req += vb
+            req = bytes(req)
+        else:
+            req = bytes([_OP_QUERY_STREAM, level]) + struct.pack("<I", len(body)) + body
         r = self._stream_open(req)
         self._note_statement(sql)
         try:
@@ -953,7 +986,8 @@ class Connection:
             if tag == _RESP_ERROR:
                 msg = r.text()
                 if "unknown opcode" in msg:
-                    raise ProgrammingError(f"server does not support streaming: {msg}")
+                    what = "parameterised streaming (skaidb >= 0.330)" if params else "streaming"
+                    raise ProgrammingError(f"server does not support {what}: {msg}")
                 raise ProgrammingError(msg)
             if tag == _RESP_MUTATION:
                 # Not a row-producing statement: one ordinary frame is the

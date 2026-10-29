@@ -255,7 +255,7 @@ def run_call(conn, call):
         return _outcome(go)
     if method == "query_stream":
         def go():
-            stream = conn.stream(call["sql"])
+            stream = conn.stream(call["sql"], [native(p) for p in call.get("params", [])])
             if not stream.columns:
                 return {"affected": str(stream.affected)}
             rows = []

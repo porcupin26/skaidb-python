@@ -286,7 +286,7 @@ use [streaming](#streaming-large-results).
 
 ## Streaming large results
 
-`conn.stream(sql, consistency=None)` runs the statement over the streaming
+`conn.stream(sql, params=None, consistency=None)` runs the statement over the streaming
 opcode and returns a `RowStream` — an iterator that holds **one chunk** of
 rows at a time. Column names arrive in the header, before any row:
 
@@ -298,7 +298,8 @@ with conn.stream("SELECT id, pad FROM big ORDER BY id") as rows:
             break                    # leaving the block drains the tail
 ```
 
-`stream()` takes SQL text only (no parameters). A non-row statement returns
+`params` bind `?` placeholders exactly as `Cursor.execute` does (server >=
+0.330; a parameterless stream works against any server). A non-row statement returns
 an already-finished, empty stream whose `affected` holds the mutation count.
 
 **The abandon/drain rule.** The connection is busy for the whole stream: any
