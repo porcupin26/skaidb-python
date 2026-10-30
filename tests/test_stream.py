@@ -113,6 +113,26 @@ def _f_mutation(affected: int) -> bytes:
     return bytes([skaidb._RESP_MUTATION]) + struct.pack("<Q", affected)
 
 
+def _f_result_sets(*sets) -> bytes:
+    """ResultSets (a CALL whose body EMITted): the set count, then each set
+    laid out as a Rows body — the columns, then the rows."""
+    out = bytearray([skaidb._RESP_RESULT_SETS]) + struct.pack("<I", len(sets))
+    for columns, rows in sets:
+        out += _f_header(columns)[1:]           # u32 ncols + names, as in the header
+        out += _f_chunk(rows)[1:]               # u32 nrows + rows, as in a chunk
+    return bytes(out)
+
+
+def _sent_ops(conn) -> list:
+    """The opcode of every request frame the fake socket received."""
+    sent, ops = bytes(conn._sock.sent), []
+    while sent:
+        (n,) = struct.unpack(">I", sent[:4])
+        ops.append(sent[4])
+        sent = sent[4 + n :]
+    return ops
+
+
 class Streaming(unittest.TestCase):
     def test_rows_columns_and_release(self):
         conn = _StreamConn().feed(
@@ -312,6 +332,30 @@ class Streaming(unittest.TestCase):
         self.assertEqual(list(rows), [])
         self.assertEqual(rows.affected, 3)
         self.assertEqual(rows.columns, [])
+        self.assertTrue(conn.is_usable())
+
+    def test_streamed_call_returns_its_result_sets(self):
+        # A CALL whose body EMITs answers with ONE ResultSets frame, streamed
+        # or not: every set, in order, and nothing left on the socket.
+        sets = _f_result_sets((["a"], [("x",), ("y",)]), (["b"], [("z",)]))
+        conn = _StreamConn().feed(sets, sets, _f_header(["n"]), _f_chunk([(1,)]), _f_end())
+        for sql, params in (("CALL report(?)", (5,)), ("CALL report()", None)):
+            rows = conn.stream(sql, params)
+            self.assertTrue(conn.is_usable(), "the whole reply is in one frame: the stream holds nothing")
+            got = []
+            while True:
+                got.append("".join(rows.columns) + ":" + "".join(r[0] for r in rows))
+                if not rows.nextset():
+                    break
+            self.assertEqual("|".join(got), "a:xy|b:z", sql)
+            self.assertIsNone(rows.nextset())
+            rows.close()
+        self.assertEqual(_sent_ops(conn), [skaidb._OP_QUERY_STREAM_PARAMS, skaidb._OP_QUERY_STREAM])
+        # The next statement on the same connection reads its own reply.
+        rows = conn.stream("SELECT n FROM t")
+        self.assertEqual(list(rows), [(1,)])
+        self.assertIsNone(rows.nextset(), "a real stream has one set")
+        self.assertEqual(conn.unread, 0)
         self.assertTrue(conn.is_usable())
 
     def test_statement_error_releases_the_connection(self):

@@ -41,7 +41,7 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 # the fallback for running straight from a source checkout that was never
 # installed (tests/test_version.py keeps it equal to pyproject.toml). The
 # server records it in its `drivers` table via the Hello frame.
-_FALLBACK_VERSION = "1.3.0"
+_FALLBACK_VERSION = "1.4.0"
 
 
 def _detect_version() -> str:
@@ -756,30 +756,35 @@ class Connection:
 
     # -- response parsing (shared by one-shot query and prepared execute) --
     @staticmethod
+    def _parse_rows(r: "_Reader"):
+        """A Rows body (PROTOCOL.md §3.2), also one set of ResultSets: `r`
+        sits just past the tag. Returns ``(columns, rows)``."""
+        ncols = r.u32()
+        columns = [r.text() for _ in range(ncols)]
+        rows = []
+        for _ in range(r.u32()):
+            ncells = r.u32()
+            rows.append(tuple(_decode_value(_Reader(r.blob())) for _ in range(ncells)))
+        return columns, rows
+
+    @staticmethod
+    def _parse_sets(r: "_Reader"):
+        """A ResultSets body (a CALL whose body EMITs), `r` just past the tag:
+        every set as ``(columns, rows)``, in emission order. The buffered path
+        and a stream request both receive this frame, and both decode it
+        here."""
+        return [Connection._parse_rows(r) for _ in range(r.u32())]
+
+    @staticmethod
     def _parse_result(r: "_Reader"):
         tag = r.u8()
         if tag == _RESP_ROWS:
-            ncols = r.u32()
-            columns = [r.text() for _ in range(ncols)]
-            rows = []
-            for _ in range(r.u32()):
-                ncells = r.u32()
-                row = tuple(_decode_value(_Reader(r.blob())) for _ in range(ncells))
-                rows.append(row)
+            columns, rows = Connection._parse_rows(r)
             return ("rows", columns, rows)
         if tag == _RESP_RESULT_SETS:
             # Several result sets (a CALL whose body EMITs): DB-API style —
             # the first set is current, `Cursor.nextset()` walks the rest.
-            sets = []
-            for _ in range(r.u32()):
-                ncols = r.u32()
-                columns = [r.text() for _ in range(ncols)]
-                rows = []
-                for _ in range(r.u32()):
-                    ncells = r.u32()
-                    rows.append(tuple(_decode_value(_Reader(r.blob())) for _ in range(ncells)))
-                sets.append((columns, rows))
-            return ("sets", sets, None)
+            return ("sets", Connection._parse_sets(r), None)
         if tag == _RESP_MUTATION:
             return ("mutation", r.u64(), None)
         if tag == _RESP_DDL:
@@ -955,6 +960,17 @@ class Connection:
                     if enough(row):
                         break
 
+        A `CALL` whose procedure body `EMIT`s result sets is answered with all
+        of them in one frame, streamed or not. The stream then owns nothing
+        and walks the sets as `Cursor.nextset()` does::
+
+            rows = conn.stream("CALL report()")
+            while True:
+                for row in rows:
+                    ...
+                if not rows.nextset():
+                    break
+
         Raises `ProgrammingError` against a server that does not know the
         opcode.
         """
@@ -996,16 +1012,13 @@ class Connection:
             if tag == _RESP_DDL:
                 return RowStream(self, [], 0, done=True)
             if tag == _RESP_RESULT_SETS:
-                # A procedure that EMITs. The server answers any non-row
-                # result as ONE ordinary frame even over the stream opcode,
-                # so the socket is at a frame boundary and the connection is
-                # perfectly healthy — it is only this API that cannot carry
-                # the shape. Refuse the call, not the connection: marking it
-                # broken here retired a working socket over a `CALL`.
-                raise InterfaceError(
-                    "this statement returns multiple result sets, which stream() "
-                    "cannot carry; run it with execute() instead"
-                )
+                # A procedure that EMITs: the server answers with every set
+                # in ONE ordinary frame even over the stream opcode — the
+                # frame `Cursor.execute()` receives, decoded by the same
+                # code. The exchange is over, so the stream is already
+                # finished: the first set is current, `nextset()` walks the
+                # rest, as `Cursor.nextset()` does.
+                return RowStream(self, [], 0, done=True, sets=self._parse_sets(r))
             if tag != _RESP_ROWS_HEADER:
                 # An unexpected reply leaves us unable to say how many frames
                 # it is made of, so the socket position is unknown.
@@ -1151,14 +1164,25 @@ class RowStream:
     end releases it; so does `close()`, which drains the frames the server
     already sent, and so does dropping the last reference. `columns` carries
     the result's column names, which arrive in the header before any row.
+
+    A `CALL` whose procedure body `EMIT`s result sets is answered with all of
+    them in one frame, streamed or not: such a stream owns nothing, starts on
+    the first set, and `nextset()` walks the rest as `Cursor.nextset()` does.
     """
 
-    def __init__(self, conn: Connection, columns: List[str], affected: int, done: bool):
+    def __init__(self, conn: Connection, columns: List[str], affected: int, done: bool,
+                 sets: "Optional[list]" = None):
         self._conn = conn
         self.columns = columns
         # Rows affected, when the statement turned out to be a mutation.
         self.affected = affected
         self._rows = iter(())
+        # The sets after the current one, of a CALL whose body EMITted.
+        self._sets: list = []
+        if sets:
+            self.columns, rows = sets[0]
+            self._rows = iter(rows)
+            self._sets = list(sets[1:])
         self._done = False
         self._released = False
         if done:
@@ -1176,6 +1200,19 @@ class RowStream:
             if self._done:
                 raise StopIteration
             self._next_frame()
+
+    def nextset(self):
+        """Advance to the next result set of a multi-set reply, as
+        `Cursor.nextset()` does: a `CALL` whose procedure body `EMIT`s result
+        sets is answered with all of them in one frame, even to a stream
+        request. `columns` and the iteration then describe that set. Returns
+        True when another set is now current, None when there is none —
+        always, for a streamed result (DB-API)."""
+        if not self._sets:
+            return None
+        self.columns, rows = self._sets.pop(0)
+        self._rows = iter(rows)
+        return True
 
     def _finish(self) -> None:
         """Mark the exchange over and hand the connection back. Idempotent,

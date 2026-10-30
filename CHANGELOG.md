@@ -4,6 +4,20 @@ All notable changes to the skaidb Python driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-10-29
+
+### Fixed
+- A streamed `CALL` whose procedure body `EMIT`s result sets returns them.
+  The server answers such a call with every set in one `ResultSets` frame
+  (tag 8) even to a stream request, and `conn.stream()`, with or without
+  parameters, refused it with `InterfaceError` ("this statement returns
+  multiple result sets, which stream() cannot carry"). The frame is now
+  decoded by the code `Cursor.execute()` uses: `stream()` returns an
+  already-finished `RowStream` on the first set, and the new
+  `RowStream.nextset()` walks the rest exactly as `Cursor.nextset()` does
+  (`True` while another set is current, `None` after the last; always
+  `None` for a streamed result). The connection is free at once.
+
 ## [1.3.0] - 2026-10-29
 
 ### Added

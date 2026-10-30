@@ -103,8 +103,10 @@ uses the connection's level. Outcomes by what the statement produced:
   holds the mutation's row count);
 - a server error before any row: `ProgrammingError`; a server without the
   opcode: `ProgrammingError("server does not support streaming: …")`;
-- a multi-result-set reply (a `CALL` that `EMIT`s): `InterfaceError` — run it
-  with `execute()` instead. The connection is left healthy.
+- a multi-result-set reply (a `CALL` that `EMIT`s, answered in one frame
+  even when streamed): an already-finished `RowStream` on the first set;
+  `nextset()` walks the rest, as `Cursor.nextset()` does. The connection is
+  free at once.
 
 Raises `ProgrammingError` if the connection is already streaming.
 
@@ -240,6 +242,7 @@ for the full contract.
 RowStream.columns: list[str]        # from the header, before any row
 RowStream.affected: int             # rows affected, when the statement was a mutation
 iter(rows) / next(rows) -> tuple    # rows, one server chunk in memory at a time
+RowStream.nextset() -> bool | None  # the next set of a CALL that EMITs; None when there is none
 RowStream.close() -> None           # finish early: drain up to 64 frames, else mark broken
 with conn.stream(sql) as rows: ...  # close() on exit
 ```
@@ -251,6 +254,10 @@ with conn.stream(sql) as rows: ...  # close() on exit
   `OperationalError` / `InterfaceError` and marks the connection broken.
 - `close()` is idempotent and is also called by `__del__`, so a stream that
   is simply dropped still follows the drain rule (errors there are swallowed).
+- A `CALL` whose body `EMIT`s result sets arrives in one frame: the stream
+  starts on the first set and `nextset()` moves `columns` and the iteration
+  to the next one, returning `True`, or `None` when there is none (always,
+  for a streamed result), as `Cursor.nextset()` does.
 
 ## `ConnectionPool` and `pool()`
 
@@ -319,7 +326,7 @@ Exception
 | Class | Raised for |
 |-------|-----------|
 | `Error` | base class; catch this for "anything the driver raised" |
-| `InterfaceError` | a truncated or malformed server message, an unknown value/response tag, an unexpected frame during a stream (connection marked broken); `stream()` of a multi-result-set statement (connection healthy) |
+| `InterfaceError` | a truncated or malformed server message, an unknown value/response tag, an unexpected frame during a stream (connection marked broken) |
 | `DatabaseError` | base of the two below |
 | `OperationalError` | no endpoint reachable, authentication denied, mutual-auth signature mismatch, a socket error or read timeout mid-request (connection marked broken), a statement on a broken connection, `rollback()` |
 | `ProgrammingError` | the server rejected the statement (an `Error` frame: bad SQL, constraint violation, unknown table, …), a parameter-count mismatch, an unbindable value type, NaN/Infinity, a non-finite or oversized `Decimal`, non-string document keys, a statement on a closed connection or on a pool that is closed, any statement while a `RowStream` is open |

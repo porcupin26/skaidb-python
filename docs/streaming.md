@@ -62,7 +62,7 @@ rows = conn.stream(sql, params=None, consistency=None)
 | `INSERT`/`UPDATE`/`DELETE` | an already-finished empty stream; `rows.affected` = rows affected |
 | DDL | an already-finished empty stream, `affected = 0` |
 | an error before any row | `ProgrammingError` from `stream()`; connection stays usable |
-| a `CALL` returning several result sets | `InterfaceError` from `stream()`; connection stays usable — use `execute()` + `nextset()` |
+| a `CALL` returning several result sets | an already-finished stream on the first set (the server sends every set in one frame); `rows.nextset()` walks the rest, as `Cursor.nextset()` does |
 | server without the streaming opcode | `ProgrammingError("server does not support streaming: …")` |
 
 `params` bind the statement's `?` placeholders, typed, exactly as

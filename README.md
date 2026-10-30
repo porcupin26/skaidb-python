@@ -300,7 +300,10 @@ with conn.stream("SELECT id, pad FROM big ORDER BY id") as rows:
 
 `params` bind `?` placeholders exactly as `Cursor.execute` does (server >=
 0.330; a parameterless stream works against any server). A non-row statement returns
-an already-finished, empty stream whose `affected` holds the mutation count.
+an already-finished, empty stream whose `affected` holds the mutation count. A `CALL`
+whose body `EMIT`s result sets is answered with all of them in one frame even when
+streamed: the stream starts on the first set and `rows.nextset()` walks the rest, as
+`Cursor.nextset()` does.
 
 **The abandon/drain rule.** The connection is busy for the whole stream: any
 other statement on it raises `ProgrammingError` until the stream ends (by
@@ -370,7 +373,7 @@ deployment supports.
 ```
 Exception
 └── skaidb.Error
-    ├── skaidb.InterfaceError        # malformed/unexpected frames; stream() of a multi-set CALL
+    ├── skaidb.InterfaceError        # malformed/unexpected frames
     └── skaidb.DatabaseError
         ├── skaidb.OperationalError  # dial/auth/transport failures, broken connection, rollback()
         └── skaidb.ProgrammingError  # the server rejected the statement; bad parameters;
