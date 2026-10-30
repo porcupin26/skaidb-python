@@ -258,13 +258,20 @@ def run_call(conn, call):
             stream = conn.stream(call["sql"], [native(p) for p in call.get("params", [])])
             if not stream.columns:
                 return {"affected": str(stream.affected)}
-            rows = []
-            try:
-                for row in stream:
-                    rows.append(row)
-            except skaidb.ProgrammingError as e:
-                return {"rows_then_error": {"rows": rows_json(stream.columns, rows), "error": str(e)}}
-            return {"rows": rows_json(stream.columns, rows)}
+            # A CALL that EMITs is answered with every set, even streamed:
+            # walk them as _cursor_result walks a cursor's.
+            sets = []
+            while True:
+                rows = []
+                try:
+                    for row in stream:
+                        rows.append(row)
+                except skaidb.ProgrammingError as e:
+                    return {"rows_then_error": {"rows": rows_json(stream.columns, rows), "error": str(e)}}
+                sets.append(rows_json(stream.columns, rows))
+                if not stream.nextset():
+                    break
+            return {"result_sets": sets} if len(sets) > 1 else {"rows": sets[0]}
 
         return _outcome(go)
     if method == "execute_prepared":
