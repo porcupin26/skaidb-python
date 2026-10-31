@@ -59,7 +59,7 @@ pool = skaidb.pool(
 | `idle_order` | `"lifo"` | `"fifo"` hands out the longest-idle connection first, so every idle connection keeps being used. |
 | `discover` | `False` | Reads the members with `SHOW ENDPOINTS` (server ≥ 0.327; no privilege needed) when a member is first reached and every `refresh_interval` (60 s) after. New members are added, members that left are dropped (seeds are kept, marked `unlisted`), and members the server reports `resyncing` or `unreachable` get no new connections until they are `ready`. An older or standalone server leaves the seeds as they are. |
 | `eject_errors` | `3` | Consecutive transport failures (dial, I/O, timeout, capacity refusal) that eject a member. Statement errors and refused logins do not count. |
-| `eject_latency_factor`, `eject_latency_floor` | `3.0`, `0.05` | A member whose round-trip average is above factor × the other members' median **and** more than floor seconds above it is ejected (after 10 samples on it and on another member). `0` disables. |
+| `eject_latency_factor`, `eject_latency_floor` | `3.0`, `0.05` | A member whose round-trip average is above factor × the other members' median **and** more than floor seconds above it is ejected (after 10 samples on it and on another member). The fastest of a member's first three round trips seeds its average, so a statement that stalls in your own process — a CPU-bound start-up — cannot get a healthy member ejected; the warning names the average, the median and the slowest of the member's last 10 round trips. `0` disables. |
 | `eject_backoff`, `eject_backoff_max` | `5.0`, `60.0` | How long an ejection lasts, doubling per repeat. Afterwards a background thread probes the member and re-admits it. The last usable member is never ejected. |
 | `read_your_writes` | `0.0` | Seconds after a write during which checkouts with the same `affinity` go to the member that took the write. |
 
@@ -101,7 +101,8 @@ statement is a write unless it starts with `SELECT`, `SHOW`, `EXPLAIN`,
   'latency_ms': 0.8, 'in_use': 2, 'idle': 3, 'seed': True}, ...]
 ```
 
-`state` is `ready`, `ejected`, `resyncing`, `unreachable` or `unlisted`.
+`state` is `ready`, `ejected`, `resyncing`, `unreachable` or `unlisted`;
+`latency_ms` is `None` until the member's third round trip.
 Ejections and re-admissions are logged at WARNING on the `skaidb.pool`
 logger. The rules are the same in every skaidb driver
 ([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members)).

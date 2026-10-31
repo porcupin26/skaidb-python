@@ -307,6 +307,63 @@ class Ejection(unittest.TestCase):
             _who(p)
         self.assertEqual(self._state(p, b), "ready")
 
+    def _fakes(self, p):
+        """Stand-ins for connections to each member, to feed the pool's
+        latency measurements round trips of a chosen length."""
+        return {
+            f.name: type("Fake", (), {"_connected": ("127.0.0.1", f.port), "_pool_ep": ("127.0.0.1", f.port)})()
+            for f in self.members
+        }
+
+    def test_a_slow_first_round_trip_does_not_eject_a_member(self):
+        # The first statements on b stall in the client — a CPU-bound
+        # application starting up holds the thread — and b answers fast from
+        # then on: the fastest of its first round trips seeds its average,
+        # so b stays in rotation. (Seeded by its first round trip alone, b's
+        # average still read ~3.8 s when the pool first compared it, and b
+        # was ejected.)
+        a, b, c = self.members
+        p = _pool(self.members, load_balancing="round_robin", eject_latency_floor=0.05)
+        self.addCleanup(p.close)
+        fake = self._fakes(p)
+        p._round_trip(fake["b"], 6.6)
+        p._round_trip(fake["b"], 3.0)
+        for _ in range(12):
+            for name in "abc":
+                p._round_trip(fake[name], 0.0002)
+        self.assertEqual(self._state(p, b), "ready")
+        self.assertLess(p._members[("127.0.0.1", b.port)].ewma, 0.05)
+
+    def test_a_member_slow_from_its_first_round_trip_is_ejected_and_the_warning_names_its_slowest(self):
+        a, b, c = self.members
+        p = _pool(self.members, load_balancing="round_robin", eject_latency_floor=0.05, eject_backoff=30)
+        self.addCleanup(p.close)
+        fake = self._fakes(p)
+        with self.assertLogs("skaidb.pool", level="WARNING") as logs:
+            for i in range(12):
+                p._round_trip(fake["a"], 0.0002)
+                p._round_trip(fake["c"], 0.0002)
+                p._round_trip(fake["b"], 0.9 if i == 5 else 0.5)
+        self.assertEqual(self._state(p, b), "ejected")
+        ejected = [line for line in logs.output if "ejecting" in line]
+        self.assertEqual(len(ejected), 1, logs.output)
+        self.assertRegex(ejected[0], r"latency 5\d\d\.\d ms vs median 0\.2 ms")
+        self.assertIn("slowest of the last 10 round trips 900.0 ms", ejected[0])
+
+    def test_a_readmitted_member_is_seeded_afresh(self):
+        a, b, c = self.members
+        p = _pool(self.members, load_balancing="round_robin")
+        self.addCleanup(p.close)
+        m = p._members[("127.0.0.1", b.port)]
+        fake = self._fakes(p)
+        for t in (0.004, 0.003, 0.002):
+            p._round_trip(fake["b"], t)
+        self.assertEqual(m.ewma, 0.002)
+        m.reset_latency()
+        self.assertEqual((m.ewma, m.firsts, list(m.recent), m.samples), (None, [], [], 0))
+        p._round_trip(fake["b"], 0.007)
+        self.assertIsNone(m.ewma, "not measured until its first three round trips")
+
     def test_the_last_usable_member_is_never_ejected(self):
         a, b, c = self.members
         b.refuse = c.refuse = True

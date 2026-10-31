@@ -21,6 +21,7 @@ learn. Placeholders use the ``qmark`` style (``?``), exactly like ``sqlite3``.
 
 from __future__ import annotations
 
+import collections
 import datetime as _dt
 import decimal
 import hashlib
@@ -41,7 +42,7 @@ from typing import Any, Iterable, List, Optional, Sequence, Tuple
 # the fallback for running straight from a source checkout that was never
 # installed (tests/test_version.py keeps it equal to pyproject.toml). The
 # server records it in its `drivers` table via the Hello frame.
-_FALLBACK_VERSION = "1.4.0"
+_FALLBACK_VERSION = "1.4.1"
 
 
 def _detect_version() -> str:
@@ -1672,12 +1673,18 @@ def _ep_text(ep: "Tuple[str, int]") -> str:
     return f"{ep[0]}:{ep[1]}"
 
 
-# Latency EWMA: each round trip moves a member's average 5% toward it, and no
-# sample counts for more than 10x the larger of the current average and the
-# ejection floor — one slow query does not eject a healthy member, a member
-# that stays slow is ejected within a few dozen statements.
+# Latency EWMA: the fastest of a member's first round trips seeds it (a round
+# trip is only ever lengthened — by the member, the network or this process
+# stalling — so a slow first statement cannot set it); then each round trip
+# moves it 5% toward it, and no sample counts for more than 10x the larger of
+# the current average and the ejection floor — one slow query does not eject
+# a healthy member, a member that stays slow is ejected within a few dozen
+# statements.
+_EWMA_SEED_SAMPLES = 3
 _EWMA_WEIGHT = 0.05
 _EWMA_CLAMP = 10.0
+# Round trips a latency ejection's warning reports the slowest of.
+_RECENT_SAMPLES = 10
 # Round trips a member (and at least one other) needs before its average
 # can eject it.
 _EWMA_MIN_SAMPLES = 10
@@ -1698,8 +1705,8 @@ class _Member:
     """One member as the pool sees it."""
 
     __slots__ = (
-        "endpoint", "seed", "canonical", "listed", "ewma", "samples", "last_sample", "errors",
-        "ejected_until", "ejections", "readmitted_at", "in_use", "probing",
+        "endpoint", "seed", "canonical", "listed", "ewma", "firsts", "recent", "samples",
+        "last_sample", "errors", "ejected_until", "ejections", "readmitted_at", "in_use", "probing",
     )
 
     def __init__(self, endpoint: "Tuple[str, int]", seed: bool):
@@ -1708,6 +1715,8 @@ class _Member:
         self.canonical: "str | None" = None  # its own SHOW ENDPOINTS name
         self.listed = "ready"  # ready | resyncing | unreachable | unlisted
         self.ewma: "float | None" = None  # seconds
+        self.firsts: "List[float]" = []  # round trips before the average is seeded
+        self.recent: "collections.deque[float]" = collections.deque(maxlen=_RECENT_SAMPLES)
         self.samples = 0
         self.last_sample = 0.0
         self.errors = 0  # consecutive transport failures
@@ -1716,6 +1725,13 @@ class _Member:
         self.readmitted_at = 0.0
         self.in_use = 0
         self.probing = False
+
+    def reset_latency(self) -> None:
+        """Measure the member afresh (a re-admission, back to ready)."""
+        self.ewma = None
+        self.firsts.clear()
+        self.recent.clear()
+        self.samples = 0
 
 
 class ConnectionPool:
@@ -2019,8 +2035,12 @@ class ConnectionPool:
             if m is None:
                 return
             m.errors = 0
+            m.recent.append(elapsed)
             if m.ewma is None:
-                m.ewma = elapsed
+                m.firsts.append(elapsed)
+                if len(m.firsts) >= _EWMA_SEED_SAMPLES:
+                    m.ewma = min(m.firsts)
+                    m.firsts.clear()
             else:
                 cap = _EWMA_CLAMP * max(m.ewma, self._eject_floor)
                 m.ewma += _EWMA_WEIGHT * (min(elapsed, cap) - m.ewma)
@@ -2029,7 +2049,12 @@ class ConnectionPool:
             # Only an admitted member can be ejected for its latency: round
             # trips still finishing on connections checked out before an
             # ejection must not eject it again (and double its backoff).
-            if self._usable(m) and m.samples >= _EWMA_MIN_SAMPLES and self._eject_factor > 0:
+            if (
+                self._usable(m)
+                and m.ewma is not None
+                and m.samples >= _EWMA_MIN_SAMPLES
+                and self._eject_factor > 0
+            ):
                 others = sorted(
                     o.ewma
                     for o in self._members.values()
@@ -2039,7 +2064,11 @@ class ConnectionPool:
                 if others:
                     median = others[(len(others) - 1) // 2]
                     if m.ewma > self._eject_factor * median and m.ewma - median > self._eject_floor:
-                        self._eject(m, f"latency {m.ewma * 1000:.1f} ms vs median {median * 1000:.1f} ms")
+                        self._eject(
+                            m,
+                            f"latency {m.ewma * 1000:.1f} ms vs median {median * 1000:.1f} ms; "
+                            f"slowest of the last {len(m.recent)} round trips {max(m.recent) * 1000:.1f} ms",
+                        )
 
     def _failed(self, ep: "Tuple[str, int]") -> None:
         with self._lock:
@@ -2128,8 +2157,7 @@ class ConnectionPool:
             elif ok:
                 m.ejected_until = None
                 m.errors = 0
-                m.ewma = None
-                m.samples = 0
+                m.reset_latency()
                 m.readmitted_at = time.monotonic()
                 _log.warning("skaidb pool: re-admitted %s", _ep_text(m.endpoint))
                 if conn is not None and len(self._idle) < self._maxsize:
@@ -2227,8 +2255,7 @@ class ConnectionPool:
             state = state if state in ("ready", "resyncing", "unreachable") else "ready"
             if state == "ready" and m.listed != "ready":
                 # Back in rotation: measured afresh, like a re-admission.
-                m.ewma = None
-                m.samples = 0
+                m.reset_latency()
                 m.errors = 0
             m.listed = state
             seen.add(id(m))
