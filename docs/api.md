@@ -154,14 +154,54 @@ Connection.closed: bool
 ### Transactions
 
 ```python
+Connection.transaction(body: Callable[[Connection], T],
+                       attempts: int = 3, begin: str = "BEGIN") -> T
 Connection.commit() -> None     # no-op
 Connection.rollback() -> None   # raises OperationalError
 ```
 
-skaidb autocommits each statement. `commit()` exists for DB-API conformance
-and does nothing; `rollback()` raises rather than silently doing nothing.
-Statement-level `BEGIN`/`COMMIT`/`ROLLBACK`, where the server supports them,
-are sent as ordinary statements.
+A transaction is statements on one connection: `BEGIN`, the statements, then
+`COMMIT` or `ROLLBACK`. Outside a transaction each statement autocommits.
+`transaction()` runs one and returns what `body` returned:
+
+1. `attempts < 1` raises `ValueError`; nothing is sent.
+2. `begin` is sent verbatim — plain `BEGIN` on a standalone server, `BEGIN
+   ATOMIC` or `BEGIN ATOMIC PARTITION (col = lit)` on a cluster. If it
+   fails, its error is raised: the body does not run and nothing else is
+   sent, because each of the body's statements would commit on its own.
+3. `body(conn)` is called with this connection.
+4. If it raises — any exception, `KeyboardInterrupt` included — `ROLLBACK`
+   is sent and the body's exception propagates unchanged. Whatever the
+   `ROLLBACK` answers is ignored (a server before 0.347 answers an error
+   when no transaction is open). Nothing is retried, even when the
+   exception is a `TransactionConflict`.
+5. Otherwise `COMMIT` is sent. On success the body's value is returned. On a
+   [`TransactionConflict`](#errors) the call goes back to step 2 while runs
+   remain — `attempts` in all, with no pause between them — and raises the
+   conflict after the last. Any other `COMMIT` error is raised as it is,
+   with no retry and no `ROLLBACK`: the transaction is already over.
+
+The body runs once per attempt, so it must be safe to run more than once and
+should do nothing outside the database that a retry would repeat.
+
+While the transaction is open — from the answer to `begin` until `COMMIT` or
+`ROLLBACK` has been answered — the connection does not re-dial, whatever
+`auto_reconnect` says: a transport failure raises `OperationalError`,
+because a statement retried on a fresh connection would run outside the
+transaction. `begin` itself re-dials like any other statement (nothing is
+open yet), and once `transaction()` has returned or raised the connection
+reconnects as usual.
+
+Finish or close any `RowStream` the body opens before it returns. While one
+is open neither `COMMIT` nor `ROLLBACK` can be sent (`ProgrammingError`, or
+the body's own exception), and the connection is marked broken rather than
+left inside an open transaction.
+
+`commit()` exists for DB-API conformance and does nothing; `rollback()`
+raises rather than silently doing nothing. Neither sends a statement.
+`BEGIN`/`COMMIT`/`ROLLBACK` can also be sent as ordinary statements: keep
+them on one connection opened with `auto_reconnect=False`, and send nothing
+more if `BEGIN` fails.
 
 ## `Cursor`
 
@@ -282,6 +322,7 @@ skaidb.ConnectionPool(
 ConnectionPool.getconn(affinity=None) -> Connection
 ConnectionPool.putconn(conn: Connection) -> None
 ConnectionPool.connection(affinity=None)   # context manager yielding a Connection
+ConnectionPool.transaction(body, attempts=3, begin="BEGIN", affinity=None)
 ConnectionPool.members() -> list[dict]     # endpoint, canonical, state, latency_ms,
                                            # in_use, idle, seed
 ConnectionPool.close() -> None
@@ -293,8 +334,11 @@ Thread-safe. `connect_kwargs` are `connect()`'s keywords; `host`/`port`/
 `maxsize` (`ValueError` if `< 1`) is the cap on **idle** connections kept;
 it does not bound concurrent checkouts and `getconn()` never blocks. An
 unknown `load_balancing` or `idle_order` raises `ValueError`. `affinity`
-scopes `read_your_writes` (any hashable; `None` = pool-wide). See
-[pooling.md](pooling.md).
+scopes `read_your_writes` (any hashable; `None` = pool-wide).
+`transaction()` checks out one connection, runs
+[`Connection.transaction`](#transactions) on it — every run a conflict costs
+included — and returns the connection to the pool; `attempts < 1` raises
+`ValueError` before a connection is taken. See [pooling.md](pooling.md).
 
 ## `Consistency`
 
@@ -321,6 +365,7 @@ Exception
     └── DatabaseError
         ├── OperationalError
         └── ProgrammingError
+            └── TransactionConflict
 ```
 
 | Class | Raised for |
@@ -330,13 +375,17 @@ Exception
 | `DatabaseError` | base of the two below |
 | `OperationalError` | no endpoint reachable, authentication denied, mutual-auth signature mismatch, a socket error or read timeout mid-request (connection marked broken), a statement on a broken connection, `rollback()` |
 | `ProgrammingError` | the server rejected the statement (an `Error` frame: bad SQL, constraint violation, unknown table, …), a parameter-count mismatch, an unbindable value type, NaN/Infinity, a non-finite or oversized `Decimal`, non-string document keys, a statement on a closed connection or on a pool that is closed, any statement while a `RowStream` is open |
+| `TransactionConflict` | a server error whose message starts with `transaction conflict:` — a `COMMIT` refused because another writer changed a row the transaction writes after its `BEGIN` (standalone server >= 0.346). Nothing was applied, the transaction is over and the connection is back in autocommit, so the transaction can be run again from `BEGIN`. A `ProgrammingError` subclass, raised on every statement path (`execute()`, `executemany()`, `stream()` and its iteration) |
 
 Raised from outside the hierarchy: `ValueError` (bad consistency level,
-`maxsize < 1`), `struct.error` (an `int` that does not fit a signed 64-bit
-integer). Message text from the server is passed through unchanged.
+`maxsize < 1`, `attempts < 1`), `struct.error` (an `int` that does not fit a
+signed 64-bit integer). Message text from the server is passed through
+unchanged.
 
-A `ProgrammingError` never breaks the connection. An `OperationalError` from
-a request (as opposed to from `connect()`) always does.
+A `ProgrammingError` never breaks the connection — a `TransactionConflict`
+included: it is not re-dialed, and a pool neither discards the connection
+nor counts the error against the member. An `OperationalError` from a
+request (as opposed to from `connect()`) always does.
 
 ## Parameters and type mapping
 

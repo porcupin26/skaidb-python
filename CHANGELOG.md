@@ -4,6 +4,33 @@ All notable changes to the skaidb Python driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-11-15
+
+### Added
+- **`conn.transaction(body, attempts=3, begin="BEGIN")`** runs a transaction
+  on one connection: it sends `begin`, calls `body(conn)`, sends `COMMIT`
+  and returns what the body returned. A body that raises gets a `ROLLBACK`
+  — whatever the `ROLLBACK` itself answers is ignored — and its exception
+  back unchanged. A `COMMIT` the server refuses for a conflict runs the
+  whole transaction again from `begin`, at once, up to `attempts` runs in
+  all, so the body must be safe to run more than once. Nothing else is
+  retried: a refused `begin` (the body then never runs), an exception from
+  the body, any other `COMMIT` error and a transport failure are raised as
+  they are. `begin` is sent verbatim (`BEGIN ATOMIC`, `BEGIN ATOMIC
+  PARTITION (col = lit)` on a cluster). While the transaction is open the
+  connection does not re-dial, whatever `auto_reconnect` says: on a fresh
+  connection a retried statement would run outside the transaction.
+  `pool.transaction(body, ...)` checks out one connection for the whole
+  transaction and returns it afterwards.
+- **`skaidb.TransactionConflict`**, a `ProgrammingError` subclass raised for
+  a server error whose message starts with `transaction conflict:` — a
+  `COMMIT` refused because another writer changed a row the transaction
+  writes after its `BEGIN` (standalone server >= 0.346). It is raised on
+  every statement path with the server's message unchanged, so code that
+  catches `ProgrammingError` keeps working. It is a statement error: the
+  connection stays usable and is not re-dialed, and a pool keeps the
+  connection and counts nothing against its member.
+
 ## [1.4.1] - 2026-10-31
 
 ### Fixed

@@ -35,14 +35,16 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple, TypeVar
+
+_T = TypeVar("_T")
 
 # The package version lives in ONE place, pyproject.toml. At runtime it is read
 # back from the installed distribution's metadata; the literal below is only
 # the fallback for running straight from a source checkout that was never
 # installed (tests/test_version.py keeps it equal to pyproject.toml). The
 # server records it in its `drivers` table via the Hello frame.
-_FALLBACK_VERSION = "1.4.1"
+_FALLBACK_VERSION = "1.5.0"
 
 
 def _detect_version() -> str:
@@ -69,6 +71,7 @@ __all__ = [
     "DatabaseError",
     "OperationalError",
     "ProgrammingError",
+    "TransactionConflict",
     "Consistency",
     "apilevel",
     "threadsafety",
@@ -106,6 +109,30 @@ class OperationalError(DatabaseError):
 
 class ProgrammingError(DatabaseError):
     """A statement failed (bad SQL, constraint, etc.)."""
+
+
+class TransactionConflict(ProgrammingError):
+    """The server refused a ``COMMIT``: another writer changed a row the
+    transaction writes after its ``BEGIN``.
+
+    Nothing was applied, the transaction is over, and the connection is back
+    in autocommit and stays usable, so running the whole transaction again
+    from ``BEGIN`` is safe — :meth:`Connection.transaction` does exactly
+    that. The message is the server's, unchanged."""
+
+
+# A server Error whose message starts with this is a refused COMMIT
+# (PROTOCOL.md §6). Only the prefix is contract: the rest of the text may
+# change.
+_CONFLICT_PREFIX = "transaction conflict:"
+
+
+def _server_error(msg: str) -> ProgrammingError:
+    """The exception for a server ``Error`` frame — a statement error, which
+    leaves the connection usable. `msg` is the server's message, unchanged."""
+    if msg.startswith(_CONFLICT_PREFIX):
+        return TransactionConflict(msg)
+    return ProgrammingError(msg)
 
 
 # ---- Consistency levels ---------------------------------------------------
@@ -469,10 +496,13 @@ def _scram_proof(password: str, salt: bytes, iterations: int, auth_message: byte
 class Connection:
     """A DB-API 2.0 connection to one skaidb node.
 
-    skaidb is non-transactional (each statement commits on its own), so
-    ``commit()`` is an accepted no-op for DB-API conformance; ``rollback()``
-    raises, since silently dropping a rollback would be worse than refusing
-    it. Use ``BEGIN``/``COMMIT``/``ROLLBACK`` as statements instead.
+    Each statement commits on its own unless a transaction is open on the
+    connection. :meth:`transaction` runs one — ``BEGIN``, your statements,
+    ``COMMIT`` — and runs it again when the server refuses the commit with a
+    :class:`TransactionConflict`; ``BEGIN``/``COMMIT``/``ROLLBACK`` can also
+    be sent as ordinary statements. The DB-API ``commit()`` is an accepted
+    no-op and ``rollback()`` raises, since silently dropping a rollback would
+    be worse than refusing it: neither sends a statement.
     """
 
     _nonce_counter = 0
@@ -481,6 +511,9 @@ class Connection:
     # instance built without __init__ (a subclass wiring its own transport).
     _broken = False
     _streaming = False
+    # True while `transaction()` has a transaction open here. The transaction
+    # lives on this socket, so nothing re-dials meanwhile (see `_run`).
+    _txn_open = False
     # An instance built without __init__ wires its own transport and cannot
     # be re-dialed, so it does not auto-reconnect.
     _auto_reconnect = False
@@ -697,11 +730,20 @@ class Connection:
         (at-least-once on failover, as in the Rust driver); an INSERT on an
         existing primary key then fails instead of duplicating. Pass
         ``auto_reconnect=False`` to :func:`connect` to surface the failure
-        instead."""
+        instead.
+
+        Inside :meth:`transaction` the failure always surfaces: on a fresh
+        connection the statement would run outside the transaction and
+        commit on its own."""
         try:
             return fn()
         except OperationalError:
-            if not (self._auto_reconnect and self._broken) or self.closed or self._streaming:
+            if (
+                not (self._auto_reconnect and self._broken)
+                or self.closed
+                or self._streaming
+                or self._txn_open
+            ):
                 raise
             self.reconnect()
             return fn()
@@ -791,7 +833,7 @@ class Connection:
         if tag == _RESP_DDL:
             return ("ddl", 0, None)
         if tag == _RESP_ERROR:
-            raise ProgrammingError(r.text())
+            raise _server_error(r.text())
         raise InterfaceError(f"unknown response tag {tag}")
 
     def _roundtrip(self, req: bytes) -> "_Reader":
@@ -840,9 +882,15 @@ class Connection:
         answer back, which is far more confusing than an error here."""
         if self.closed:
             raise ProgrammingError("connection is closed")
-        if self._broken and self._auto_reconnect and not self._streaming:
+        if (
+            self._broken
+            and self._auto_reconnect
+            and not self._streaming
+            and not self._txn_open
+        ):
             # Nothing of this request has been sent: re-dialing first is
-            # always safe.
+            # always safe — except inside `transaction()`, whose transaction
+            # died with the old socket.
             self.reconnect()
         if self._broken:
             raise OperationalError(
@@ -881,7 +929,7 @@ class Connection:
             msg = r.text()
             if "cannot be prepared" in msg:
                 raise _Unpreparable(msg)
-            raise ProgrammingError(msg)
+            raise _server_error(msg)
         raise InterfaceError(f"unexpected prepare response tag {tag}")
 
     def _execute_prepared(self, stmt_id: int, params: Sequence[Any], consistency: int):
@@ -1005,7 +1053,7 @@ class Connection:
                 if "unknown opcode" in msg:
                     what = "parameterised streaming (skaidb >= 0.330)" if params else "streaming"
                     raise ProgrammingError(f"server does not support {what}: {msg}")
-                raise ProgrammingError(msg)
+                raise _server_error(msg)
             if tag == _RESP_MUTATION:
                 # Not a row-producing statement: one ordinary frame is the
                 # whole reply, so the stream is empty and already finished.
@@ -1132,6 +1180,92 @@ class Connection:
         cur = self.cursor()
         cur.execute(sql, params)
         return cur
+
+    def transaction(
+        self,
+        body: "Callable[[Connection], _T]",
+        attempts: int = 3,
+        begin: str = "BEGIN",
+    ) -> "_T":
+        """Run ``body(conn)`` inside a transaction on this connection and
+        return what it returned::
+
+            def move(conn):
+                conn.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", (10, 1))
+                conn.execute("UPDATE accounts SET balance = balance + ? WHERE id = ?", (10, 2))
+
+            conn.transaction(move)
+
+        Sends ``begin``, calls ``body`` with this connection, then sends
+        ``COMMIT``. ``begin`` is the opening statement, sent verbatim: plain
+        ``BEGIN`` on a standalone server, ``BEGIN ATOMIC`` or ``BEGIN ATOMIC
+        PARTITION (col = lit)`` on a cluster.
+
+        * If ``begin`` fails, its error is raised and nothing else is sent:
+          the body does not run, because each of its statements would commit
+          on its own.
+        * If the body raises, ``ROLLBACK`` is sent — whatever it answers is
+          ignored — and the body's exception propagates unchanged. Nothing
+          is retried, whatever the exception is.
+        * If the server refuses the ``COMMIT`` with a
+          :class:`TransactionConflict` (another writer changed a row the
+          transaction writes; nothing was applied), the whole transaction
+          runs again from ``begin``, at once, up to ``attempts`` runs in
+          all; the last run's conflict is raised. So ``body`` must be safe
+          to run more than once, and should do nothing outside the database
+          that a retry would repeat.
+        * Any other ``COMMIT`` error is raised as it is: the transaction is
+          already over, so there is no retry and no ``ROLLBACK``.
+
+        ``attempts`` below 1 raises ``ValueError`` before anything is sent.
+        Once ``begin`` has been answered, a transport failure is the usual
+        ``OperationalError`` and nothing is retried, by the automatic
+        reconnect either: the transaction was on the connection that failed.
+        (``begin`` itself re-dials like any statement — nothing is open
+        yet.) Finish or close any :class:`RowStream` the body opens before
+        it returns: while one is open neither ``COMMIT`` nor ``ROLLBACK``
+        can be sent, and the connection is marked broken rather than left
+        inside an open transaction.
+        """
+        if attempts < 1:
+            raise ValueError("attempts must be >= 1")
+        left = attempts
+        while True:
+            left -= 1
+            # A refused `begin` opened nothing: going on would autocommit
+            # each of the body's statements, so its error ends the call.
+            self.execute(begin)
+            outer, self._txn_open = self._txn_open, True
+            try:
+                try:
+                    result = body(self)
+                except BaseException:
+                    # The body's error is the one raised, whatever ROLLBACK
+                    # answers (a server before 0.347 refuses a ROLLBACK with
+                    # nothing open) and even if it cannot be sent.
+                    try:
+                        self.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                    raise
+                try:
+                    self.execute("COMMIT")
+                except TransactionConflict:
+                    # Refused: nothing was applied and the transaction is
+                    # over. The other writer has already finished, so the
+                    # next run starts at once and reads the rows as they
+                    # are now.
+                    if left < 1:
+                        raise
+                else:
+                    return result
+            finally:
+                self._txn_open = outer
+                if self._streaming:
+                    # A RowStream the body left open kept COMMIT / ROLLBACK
+                    # from being sent, so the transaction is still open on
+                    # this socket: it must not carry another statement.
+                    self._broken = True
 
     def commit(self) -> None:  # no-op: skaidb auto-commits each statement
         pass
@@ -1261,7 +1395,7 @@ class RowStream:
             # The error frame ends the exchange, so the socket is back at a
             # request boundary and the connection stays usable.
             self._finish()
-            raise ProgrammingError(fr.text())
+            raise _server_error(fr.text())
         conn._broken = True
         self._finish()
         raise InterfaceError(f"unexpected frame tag {t} in stream")
@@ -1891,6 +2025,24 @@ class ConnectionPool:
             yield conn
         finally:
             self.putconn(conn)
+
+    def transaction(
+        self,
+        body: "Callable[[Connection], _T]",
+        attempts: int = 3,
+        begin: str = "BEGIN",
+        affinity: Any = None,
+    ) -> "_T":
+        """Check out ONE connection, run :meth:`Connection.transaction` on
+        it and return the connection to the pool: every statement of the
+        transaction, and of every run a conflict costs, goes over that
+        connection. ``body`` gets the connection and must use it, never
+        another checkout — a statement on another connection is outside the
+        transaction. ``affinity`` is the checkout's (see :meth:`getconn`)."""
+        if attempts < 1:
+            raise ValueError("attempts must be >= 1")
+        with self.connection(affinity) as conn:
+            return conn.transaction(body, attempts, begin)
 
     def members(self) -> "list[dict]":
         """The members as the pool sees them, for monitoring: ``endpoint``,

@@ -64,7 +64,8 @@ with skaidb.connect(host="localhost", user="skaidb", password="secret") as conn:
   abandon/drain rule
 - [Connection pool](#connection-pool)
 - [Streams (`CREATE STREAM`)](#streams-create-stream) — `subscribe()`
-- [Transactions](#transactions)
+- [Transactions](#transactions) — `transaction()`, conflicts and the retry,
+  the two rules
 - [Errors](#errors)
 - [Thread safety](#thread-safety)
 - [Compatibility](#compatibility)
@@ -122,8 +123,10 @@ sets fixed values lands the same row twice — but a statement that computes
 from the current row does not: `UPDATE … SET n = n + 1`, `INSERT … ON
 CONFLICT DO UPDATE SET n = n + 1`, or a row keyed by a sequence. Run those
 with `auto_reconnect=False` (or make them idempotent). A stream cannot be
-retried mid-way. Pass `auto_reconnect=False` to handle `OperationalError`
-yourself.
+retried mid-way, and nothing re-dials while `conn.transaction()` has its
+transaction open: it lives on the connection that failed (see
+[transactions](#transactions)). Pass `auto_reconnect=False` to handle
+`OperationalError` yourself.
 
 **Certificate login.** With `auth_mechanism="certificate"` and
 `tls_client_cert` / `tls_client_key`, the TLS client certificate is the
@@ -361,12 +364,85 @@ instead; the events are identical.
 
 ## Transactions
 
-skaidb autocommits every statement. `conn.commit()` is an accepted no-op for
-DB-API conformance; `conn.rollback()` raises `OperationalError`, since silently
-dropping a rollback would be worse than refusing it. Where your server
-supports statement-level transaction control, issue `BEGIN`/`COMMIT`/`ROLLBACK`
-as ordinary statements; see the server documentation for what your
-deployment supports.
+A transaction is ordinary statements on one connection: `BEGIN`, the
+statements, then `COMMIT` or `ROLLBACK`. Outside a transaction every
+statement autocommits. `conn.transaction(body, attempts=3, begin="BEGIN")`
+runs the whole sequence and returns what the body returned:
+
+```python
+def move(conn):
+    conn.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", (10, 1))
+    conn.execute("UPDATE accounts SET balance = balance + ? WHERE id = ?", (10, 2))
+    return conn.execute("SELECT balance FROM accounts WHERE id = ?", (1,)).fetchone()[0]
+
+balance = conn.transaction(move)          # BEGIN, move(conn), COMMIT
+```
+
+- If the body raises, `ROLLBACK` is sent and the body's exception propagates
+  unchanged; whatever the `ROLLBACK` itself answers is ignored.
+- If the server refuses the `COMMIT` for a conflict (below), the whole
+  transaction runs again from `BEGIN` — at once, with no pause — up to
+  `attempts` runs in all, and the last run's conflict is raised. **The body
+  must be safe to run more than once**, and should do nothing outside the
+  database that a retry would repeat.
+- Nothing else is retried: an exception from the body (a conflict included),
+  any other `COMMIT` error and a transport failure are raised as they are.
+  `attempts` below 1 raises `ValueError` before anything is sent.
+- `begin` is the opening statement, sent verbatim: plain `BEGIN` on a
+  standalone server, `BEGIN ATOMIC` or `BEGIN ATOMIC PARTITION (col = lit)`
+  on a cluster.
+
+`pool.transaction(body, attempts=3, begin="BEGIN")` does the same from a
+[pool](#connection-pool): it checks out one connection for the whole
+transaction and returns it afterwards.
+
+**Conflicts.** A standalone server (>= 0.346) refuses a `COMMIT` when another
+writer changed a row the transaction writes after its `BEGIN`. Nothing was
+applied, the transaction is over, and the connection is back in autocommit
+and stays usable, so running the transaction again from `BEGIN` is safe. The
+driver raises this as `skaidb.TransactionConflict` — a `ProgrammingError`,
+so code that catches that keeps working — for any server error that starts
+with `transaction conflict:`; the message is the server's.
+
+The same transaction written by hand:
+
+```python
+conn.execute("BEGIN")                     # if this raises, stop here
+try:
+    conn.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", (10, 1))
+    conn.execute("UPDATE accounts SET balance = balance + ? WHERE id = ?", (10, 2))
+except BaseException:
+    try:
+        conn.execute("ROLLBACK")
+    except skaidb.Error:
+        pass                              # keep the error that brought us here
+    raise
+try:
+    conn.execute("COMMIT")
+except skaidb.TransactionConflict:
+    ...                                   # nothing was applied: run it again from BEGIN
+```
+
+Two rules hold for both forms:
+
+- **One connection for the whole transaction.** The transaction belongs to
+  the connection that sent `BEGIN`; a statement on any other connection is
+  outside it and commits on its own. From a pool, keep one checkout for the
+  duration (`pool.transaction(body)`, or one `with pool.connection() as conn:`
+  block) and use only the connection you were given. The automatic reconnect
+  would break this rule — a statement retried on a fresh connection runs
+  outside the transaction — so `transaction()` switches it off from the
+  answer to `BEGIN` until its transaction has ended; for a hand-written
+  transaction, connect with `auto_reconnect=False`.
+- **Stop if `BEGIN` fails.** When the opening statement raises, no
+  transaction is open and every statement after it would commit on its own.
+  `transaction()` raises that error without calling the body.
+
+The DB-API methods send nothing: `conn.commit()` is an accepted no-op for
+DB-API conformance, and `conn.rollback()` raises `OperationalError`, since
+silently dropping a rollback would be worse than refusing it. End a
+transaction with `transaction()` or with the `COMMIT` / `ROLLBACK`
+statements.
 
 ## Errors
 
@@ -377,16 +453,20 @@ Exception
     └── skaidb.DatabaseError
         ├── skaidb.OperationalError  # dial/auth/transport failures, broken connection, rollback()
         └── skaidb.ProgrammingError  # the server rejected the statement; bad parameters;
-                                     # closed connection; statement while streaming
+            │                        # closed connection; statement while streaming
+            └── skaidb.TransactionConflict  # the server refused a COMMIT: another
+                                            # writer changed a row the transaction writes
 ```
 
 - A server `Error` frame is a **statement** error (`ProgrammingError`); the
-  connection stays usable.
+  connection stays usable. One whose message starts with `transaction
+  conflict:` is a `TransactionConflict` (see [transactions](#transactions)).
 - A transport failure (`OperationalError`) marks the connection broken. With
   `auto_reconnect` (the default) the failed statement re-dials and retries
   once; otherwise call `reconnect()` or let the pool replace it.
-- Outside the hierarchy: `ValueError` for an invalid consistency level or
-  `maxsize < 1`, and `struct.error` for an `int` beyond 64 bits.
+- Outside the hierarchy: `ValueError` for an invalid consistency level,
+  `maxsize < 1` or `attempts < 1`, and `struct.error` for an `int` beyond
+  64 bits.
 
 ## Thread safety
 

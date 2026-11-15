@@ -25,6 +25,7 @@ skaidb.pool(maxsize: int = 10, **kwargs) -> ConnectionPool
 ConnectionPool.connection(affinity=None)  # context manager: getconn() / putconn()
 ConnectionPool.getconn(affinity=None) -> Connection
 ConnectionPool.putconn(conn) -> None
+ConnectionPool.transaction(body, attempts=3, begin="BEGIN", affinity=None)
 ConnectionPool.members() -> list[dict]
 ConnectionPool.close() -> None
 ConnectionPool.closed: bool
@@ -143,6 +144,29 @@ before the `pool.connection()` block exits; a connection returned mid-stream
 is closed rather than reused (its socket still has rows queued). A stream
 abandoned with more than 64 frames in flight marks the connection broken,
 and the pool replaces it. See [streaming.md](streaming.md).
+
+## Transactions and the pool
+
+A transaction belongs to the connection that sent its `BEGIN`, so it needs
+one checkout for the whole of it. `pool.transaction(body)` does that: it
+checks out a connection, runs
+[`conn.transaction(body)`](api.md#transactions) on it — every run a conflict
+costs included — and returns the connection.
+
+```python
+def move(conn):
+    conn.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", (10, 1))
+    conn.execute("UPDATE accounts SET balance = balance + ? WHERE id = ?", (10, 2))
+
+pool.transaction(move)
+```
+
+Run every statement of the transaction on the connection the body is given;
+one run on another checkout is outside the transaction and commits on its
+own. A `TransactionConflict` is a statement error: the connection goes back
+to the pool and nothing counts against its member. A connection lost
+mid-transaction is not re-dialed — the `OperationalError` is raised and the
+connection is discarded on check-in.
 
 ## Retrying
 
