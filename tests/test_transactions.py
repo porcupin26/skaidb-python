@@ -723,6 +723,42 @@ class OneConnection(_Case):
                 self.assertEqual(self.server.connections, before + 1)
 
 
+# ---- the DB-API methods -----------------------------------------------------
+
+
+class CommitAndRollbackMethods(_Case):
+    """DB-API `commit()` and `rollback()` send nothing — the first is
+    accepted, the second raises — and say so without denying that the
+    database has transactions: they are just not how to end one."""
+
+    def test_neither_sends_a_statement(self):
+        self.conn.execute("BEGIN")
+        self.conn.execute(DEBIT)
+        self.assertIsNone(self.conn.commit())
+        with self.assertRaises(skaidb.OperationalError):
+            self.conn.rollback()
+        self.assertEqual(self.server.statements, ["BEGIN", DEBIT])
+        self.assert_usable()
+
+    def test_rollback_says_what_ends_a_transaction(self):
+        with self.assertRaises(skaidb.OperationalError) as cm:
+            self.conn.rollback()
+        said = str(cm.exception)
+        self.assertNotIn("does not support rollback", said)
+        self.assertNotIn("auto-commit only", said)
+        self.assertIn("sends nothing", said)
+        self.assertIn('execute("ROLLBACK")', said)
+        self.assertIn("transaction()", said)
+
+    def test_their_documentation_says_they_send_nothing_and_what_to_use(self):
+        for method, statement in ((self.conn.commit, "COMMIT"), (self.conn.rollback, "ROLLBACK")):
+            with self.subTest(method.__name__):
+                doc = " ".join((method.__doc__ or "").split())
+                self.assertIn("sends nothing", doc)
+                self.assertIn(":meth:`transaction`", doc)
+                self.assertIn(f'conn.execute("{statement}")', doc)
+
+
 # ---- the pool ---------------------------------------------------------------
 
 

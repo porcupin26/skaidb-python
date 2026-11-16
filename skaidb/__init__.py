@@ -729,9 +729,11 @@ class Connection:
         self._database = db
 
     def reconnect(self) -> None:
-        """Re-dial (failing over across endpoints) and re-authenticate,
-        discarding any per-connection prepared statements. A pool calls this to
-        recover a broken connection.
+        """Re-dial (failing over across endpoints), re-authenticate and
+        enter the session's database again, discarding any per-connection
+        prepared statements. With ``auto_reconnect`` the connection calls
+        this itself, before a statement on a broken connection and after one
+        whose connection failed in transit.
 
         Refused with ``ProgrammingError`` while :meth:`transaction` has its
         transaction open: the transaction lives on the socket it began on,
@@ -1390,11 +1392,24 @@ class Connection:
                     # closing it is what ends the transaction on the server.
                     self._mark_broken()
 
-    def commit(self) -> None:  # no-op: skaidb auto-commits each statement
-        pass
+    def commit(self) -> None:
+        """DB-API ``commit()``: accepted, and sends nothing. It does not
+        commit a transaction opened with ``BEGIN`` — run the transaction
+        with :meth:`transaction`, or send the statement yourself with
+        ``conn.execute("COMMIT")``. Outside a transaction there is nothing
+        to commit: each statement has committed on its own."""
 
-    def rollback(self) -> None:  # refused: there is nothing to roll back
-        raise OperationalError("skaidb does not support rollback (auto-commit only)")
+    def rollback(self) -> None:
+        """DB-API ``rollback()``: always raises ``OperationalError``, and
+        sends nothing — a rollback silently dropped would be worse than one
+        refused. To roll a transaction back, raise from the body of
+        :meth:`transaction`, or send the statement yourself with
+        ``conn.execute("ROLLBACK")``."""
+        raise OperationalError(
+            "rollback() sends nothing: roll a transaction back with "
+            'conn.execute("ROLLBACK"), or run it with conn.transaction(), '
+            "which rolls back when its body raises"
+        )
 
     def close(self) -> None:
         if not self.closed:
