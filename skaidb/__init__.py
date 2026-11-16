@@ -973,7 +973,11 @@ class Connection:
         transaction open: the transaction lives on the socket it began on,
         so after a re-dial the rest of the body would commit statement by
         statement and the ``COMMIT`` would reach a session with nothing to
-        commit."""
+        commit. Refused the same way while a transaction begun with a
+        ``BEGIN`` statement is open on a live connection. Once that
+        connection is lost the transaction is gone with it, and
+        ``reconnect()`` ends it and dials: run the transaction again from
+        ``BEGIN`` — a statement sent now commits on its own."""
         if self.closed:
             raise ProgrammingError("connection is closed")
         if self._txn_open:
@@ -984,13 +988,19 @@ class Connection:
                 "end the transaction and run it again"
             )
         if self._txn_noted:
-            raise ProgrammingError(
-                "reconnect() with a transaction open: the transaction is on "
-                "the connection it began on, and on a new one the statements "
-                "that follow would each commit on their own; end it first "
-                "(ROLLBACK — answered here once the connection is lost) and "
-                "run it again"
-            )
+            if not self._broken:
+                raise ProgrammingError(
+                    "reconnect() with a transaction open: the transaction is "
+                    "on the connection it began on, and on a new one the "
+                    "statements that follow would each commit on their own; "
+                    "end it first (COMMIT or ROLLBACK)"
+                )
+            # The connection is lost, and the transaction went with it:
+            # dialing again by hand is the application saying so — what it
+            # does about a lost connection without the automatic reconnect,
+            # before it runs the transaction again from BEGIN. It ends the
+            # transaction as a ROLLBACK would (`_lost_before`).
+            self._txn_noted = False
         # Try every OTHER endpoint before the one that just failed: a member
         # going down during a rolling restart still accepts a connect for a
         # moment, and re-dialing it first lost the retry (and an 8-hour

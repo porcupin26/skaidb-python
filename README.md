@@ -239,7 +239,8 @@ DDL is always run at quorum by the server regardless of this setting.
 - `conn.ping()` — a real round-trip (`SHOW DATABASES`); `False` when it
   fails (a transport failure also marks the connection broken).
 - `conn.reconnect()` — re-dial (failing over across seeds), re-authenticate
-  and put the session state back. Refused while a transaction is open.
+  and put the session state back. Refused while a transaction is open on a
+  live connection.
 - `conn.closed` — `True` after `close()`.
 
 A connection is marked **broken** when its socket is dead or out of step with
@@ -523,9 +524,9 @@ Two rules hold for both forms:
   would break this rule — a statement retried on a fresh connection runs
   outside the transaction — so the connection notes a transaction, from a
   `BEGIN` the server accepted until `COMMIT` or `ROLLBACK` is answered, and
-  does not re-dial while one is open (nor accept `conn.reconnect()`:
-  `ProgrammingError`). That holds for `transaction()` and for a `BEGIN` you
-  send yourself alike.
+  does not re-dial while one is open (nor accept `conn.reconnect()` in the
+  middle of one: `ProgrammingError`). That holds for `transaction()` and for
+  a `BEGIN` you send yourself alike.
 - **Stop if `BEGIN` fails.** When the opening statement raises, no
   transaction is open and every statement after it would commit on its own.
   `transaction()` raises that error without calling the body.
@@ -538,7 +539,9 @@ its own. `transaction()` reports the loss and is done. A transaction written
 by hand is ended where it is: `ROLLBACK` (or `conn.rollback()`) succeeds
 without being sent, `COMMIT` (or `conn.commit()`) raises an
 `OperationalError` saying that nothing was committed. After either, the next
-statement re-dials as usual. The one case with an unknown outcome is a
+statement re-dials as usual. Without the automatic reconnect,
+`conn.reconnect()` ends the lost transaction as well as dialing: run the
+transaction again from `BEGIN`. The one case with an unknown outcome is a
 connection lost under the `COMMIT` itself — the server may have applied it
 before its reply went missing — and that error says so instead.
 

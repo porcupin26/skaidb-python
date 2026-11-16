@@ -163,10 +163,11 @@ Connection.closed: bool
 - `reconnect()` drops the socket, re-dials — the other endpoints before the
   one it was connected to — re-authenticates, re-sends Hello, puts the
   [session state](#session-state) back and clears the prepared-statement
-  cache. Raises `ProgrammingError` on a closed connection, and while a
-  [transaction](#transactions) is open. If it does not finish — no endpoint,
-  the `USE` or a setting refused, an interrupt — the connection is left
-  broken.
+  cache. Raises `ProgrammingError` on a closed connection, and in the
+  middle of a [transaction](#transactions): inside `transaction()`, or with
+  one begun by a `BEGIN` statement open on a live connection. If it does
+  not finish — no endpoint, the `USE` or a setting refused, an interrupt —
+  the connection is left broken.
 - `close()` is idempotent. `with connect(...) as conn:` closes on exit.
 
 ### Broken connections
@@ -297,12 +298,12 @@ success or with an error, since a refused `COMMIT` has ended the transaction
 too.
 
 While one is open the connection does not re-dial, whatever
-`auto_reconnect` says, and `reconnect()` raises `ProgrammingError`: a
-statement on a fresh connection would run outside the transaction and commit
-on its own. (`begin` itself re-dials like any other statement — nothing is
-open yet.) When the connection is lost — under a statement, or found closed
-by the look at the idle socket — the server discards the transaction with
-it, and:
+`auto_reconnect` says, and `reconnect()` in the middle of it raises
+`ProgrammingError`: a statement on a fresh connection would run outside the
+transaction and commit on its own. (`begin` itself re-dials like any other
+statement — nothing is open yet.) When the connection is lost — under a
+statement, or found closed by the look at the idle socket — the server
+discards the transaction with it, and:
 
 - the statement under which it was lost raises `OperationalError`, and so
   does every statement after it, without being sent;
@@ -313,7 +314,10 @@ it, and:
   without being sent, and `COMMIT` — the statement, or `commit()` — raises
   an `OperationalError` saying that the connection was lost and nothing was
   committed. Either one ends the transaction, and the next statement
-  re-dials, session state put back;
+  re-dials, session state put back. So does `reconnect()`, once the
+  connection is lost: it is how an application without the automatic
+  reconnect starts over, before it runs the transaction again from `BEGIN`.
+  (Inside `transaction()` it stays refused: the helper reports the loss.);
 - a connection lost under the `COMMIT` itself is the one unknown outcome:
   the server may have applied it before its reply went missing. That
   `OperationalError` says so and claims neither; the transaction is over.

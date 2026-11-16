@@ -1286,14 +1286,47 @@ class HandWritten(_Case):
         self.conn.reconnect()
         self.assertEqual(self.server.connections, 2)
 
-    def test_reconnect_is_refused_after_the_loss_until_the_transaction_is_ended(self):
+    def test_reconnect_after_the_loss_ends_the_lost_transaction(self):
+        # What an application without the automatic reconnect does about a
+        # lost connection: reconnect(), and run the transaction again from
+        # BEGIN. That is the application saying the transaction is gone —
+        # never the driver replacing a connection behind its back.
+        conn = skaidb.connect(**dict(_credentials(self.server), auto_reconnect=False))
+        self.addCleanup(conn.close)
+        self.server.log.clear()
+
+        def transfer():
+            conn.execute("BEGIN")
+            conn.execute(ROW % 1)
+            conn.execute(ROW % 2)
+            conn.execute("COMMIT")
+
+        self.server.on(ROW % 2, DROP)
+        with self.assertRaises(skaidb.OperationalError):
+            transfer()
+        conn.reconnect()
+        self.assertFalse(conn._txn_noted)
+        transfer()
+        self.assertEqual(
+            self.server.log,
+            [(2, "BEGIN"), (2, ROW % 1), (2, ROW % 2)]
+            + [(3, "BEGIN"), (3, ROW % 1), (3, ROW % 2), (3, "COMMIT")],
+        )
+        # With nothing open it is the next statement's connection to lose.
+        self.server.on(DEBIT, DROP)
+        with self.assertRaises(skaidb.OperationalError):
+            conn.execute(DEBIT)
+        conn.reconnect()
+        self.assertEqual(conn.execute(DEBIT).rowcount, 1)
+
+    def test_reconnect_after_the_loss_with_the_automatic_reconnect_too(self):
         self.lost_after_row_1()
-        with self.assertRaises(skaidb.ProgrammingError):
-            self.conn.reconnect()
-        self.assertEqual(self.server.connections, 1)
-        self.conn.execute("ROLLBACK")
         self.conn.reconnect()
+        self.assertEqual(self.server.connections, 2)
+        # The transaction is over: the statement commits on its own.
         self.assertEqual(self.conn.execute("SELECT 1").fetchall(), [(1,)])
+        self.server.on(DEBIT, DROP)
+        self.assertEqual(self.conn.execute(DEBIT).rowcount, 1, "still noted open")
 
     def test_without_automatic_reconnect_the_same_holds(self):
         conn = skaidb.connect(**dict(_credentials(self.server), auto_reconnect=False))
