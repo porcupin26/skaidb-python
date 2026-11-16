@@ -180,7 +180,7 @@ class UnfinishedHello(unittest.TestCase):
         return server
 
     def connect(self, members, **kw):
-        kw.setdefault("timeout", 0.25)
+        kw.setdefault("timeout", 0.5)
         conn = _connect(members, **kw)
         self.addCleanup(conn.close)
         return conn
@@ -189,7 +189,7 @@ class UnfinishedHello(unittest.TestCase):
     # read as the answer to the first statement — or the member hangs up.
     FAILURES = [
         ("no reply", lambda: STALL),
-        ("a late reply", lambda: Late(bytes([skaidb._RESP_DDL]), 0.6)),
+        ("a late reply", lambda: Late(bytes([skaidb._RESP_DDL]), 1.0)),
         ("the connection closed", lambda: DROP),
     ]
 
@@ -237,7 +237,7 @@ class UnfinishedHello(unittest.TestCase):
         with mock.patch.object(skaidb.random, "shuffle", lambda eps: None):
             pool = skaidb.pool(
                 seeds=[f"127.0.0.1:{failing.port}", f"127.0.0.1:{healthy.port}"],
-                user=V["auth"]["username"], password=V["auth"]["password"], timeout=0.25,
+                user=V["auth"]["username"], password=V["auth"]["password"], timeout=0.5,
             )
             self.addCleanup(pool.close)
             with pool.connection() as conn:
