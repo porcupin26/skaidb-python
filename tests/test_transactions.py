@@ -1335,36 +1335,116 @@ class TransactionStatements(unittest.TestCase):
 
 
 class CommitAndRollbackMethods(_Case):
-    """DB-API `commit()` and `rollback()` send nothing — the first is
-    accepted, the second raises — and say so without denying that the
-    database has transactions: they are just not how to end one."""
+    """DB-API `commit()` and `rollback()` agree with the transaction the
+    driver has noted: they end one that is open, by sending `COMMIT` /
+    `ROLLBACK`, and send nothing when none is — where every statement has
+    committed on its own, and frameworks call both as a matter of routine."""
 
-    def test_neither_sends_a_statement(self):
+    def test_commit_ends_a_transaction_that_is_open(self):
         self.conn.execute("BEGIN")
         self.conn.execute(DEBIT)
         self.assertIsNone(self.conn.commit())
-        with self.assertRaises(skaidb.OperationalError):
-            self.conn.rollback()
-        self.assertEqual(self.server.statements, ["BEGIN", DEBIT])
+        self.assertEqual(self.server.statements, ["BEGIN", DEBIT, "COMMIT"])
+        # Ended: a second call has nothing to commit.
+        self.conn.commit()
+        self.assertEqual(self.server.statements, ["BEGIN", DEBIT, "COMMIT"])
         self.assert_usable()
 
-    def test_rollback_says_what_ends_a_transaction(self):
-        with self.assertRaises(skaidb.OperationalError) as cm:
-            self.conn.rollback()
-        said = str(cm.exception)
-        self.assertNotIn("does not support rollback", said)
-        self.assertNotIn("auto-commit only", said)
-        self.assertIn("sends nothing", said)
-        self.assertIn('execute("ROLLBACK")', said)
-        self.assertIn("transaction()", said)
+    def test_rollback_ends_a_transaction_that_is_open(self):
+        self.conn.execute("BEGIN")
+        self.conn.execute(DEBIT)
+        self.assertIsNone(self.conn.rollback())
+        self.assertEqual(self.server.statements, ["BEGIN", DEBIT, "ROLLBACK"])
+        self.conn.rollback()
+        self.assertEqual(self.server.statements, ["BEGIN", DEBIT, "ROLLBACK"])
+        self.assert_usable()
 
-    def test_their_documentation_says_they_send_nothing_and_what_to_use(self):
+    def test_neither_sends_anything_when_no_transaction_is_open(self):
+        self.conn.commit()
+        self.conn.rollback()
+        self.conn.execute(DEBIT)  # committed on its own
+        self.conn.commit()
+        self.conn.rollback()
+        self.conn.execute("BEGIN")
+        self.conn.execute("ROLLBACK")  # ended by the statement
+        self.conn.commit()
+        self.conn.rollback()
+        self.assertEqual(self.server.statements, [DEBIT, "BEGIN", "ROLLBACK"])
+
+    def test_a_begin_the_server_refused_opened_nothing_to_end(self):
+        self.server.on("BEGIN", _f_error("permission denied"))
+        with self.assertRaises(skaidb.ProgrammingError):
+            self.conn.execute("BEGIN")
+        self.conn.commit()
+        self.conn.rollback()
+        self.assertEqual(self.server.statements, ["BEGIN"])
+
+    def test_commit_raises_what_the_server_answers_and_the_transaction_is_over(self):
+        self.server.on("COMMIT", _f_error(CONFLICT))
+        self.conn.execute("BEGIN")
+        self.conn.execute(DEBIT)
+        with self.assertRaises(skaidb.TransactionConflict) as cm:
+            self.conn.commit()
+        self.assertEqual(str(cm.exception), CONFLICT)
+        # The usual clean-up after a failed commit does not replace the
+        # conflict with an error of its own, and sends nothing.
+        self.conn.rollback()
+        self.assertEqual(self.server.statements, ["BEGIN", DEBIT, "COMMIT"])
+        self.assert_usable()
+
+    def test_after_a_lost_connection_rollback_ends_the_transaction_here(self):
+        self.conn.execute("BEGIN")
+        self.server.on(DEBIT, DROP)
+        with self.assertRaises(skaidb.OperationalError):
+            self.conn.execute(DEBIT)
+        self.assertIsNone(self.conn.rollback())
+        self.assertEqual(self.server.log, [(1, "BEGIN"), (1, DEBIT)], "sent to a new session")
+        self.assertEqual(self.conn.execute("SELECT 1").fetchall(), [(1,)])
+        self.assertEqual(self.server.log[-1], (2, "SELECT 1"))
+
+    def test_after_a_lost_connection_commit_says_nothing_was_committed(self):
+        self.conn.execute("BEGIN")
+        self.server.on(DEBIT, DROP)
+        with self.assertRaises(skaidb.OperationalError):
+            self.conn.execute(DEBIT)
+        with self.assertRaises(skaidb.OperationalError) as cm:
+            self.conn.commit()
+        self.assertIn("nothing was committed", str(cm.exception))
+        self.assertEqual(self.server.log, [(1, "BEGIN"), (1, DEBIT)], "sent to a new session")
+        self.conn.commit()  # over: nothing to commit, nothing raised
+        self.assertEqual(self.conn.execute("SELECT 1").fetchall(), [(1,)])
+
+    def test_inside_transaction_the_helper_ends_its_transaction(self):
+        # A body written with the DB-API habit must not end the helper's
+        # transaction half way: commit() leaves it to the helper …
+        def commits(conn):
+            conn.execute(DEBIT)
+            conn.commit()
+            conn.execute(CREDIT, (10, 2))
+
+        self.conn.transaction(commits)
+        self.assertEqual(self.server.statements, ["BEGIN", DEBIT, CREDIT, "COMMIT"])
+
+        # … and rollback() says how a body rolls back: by raising.
+        def rolls_back(conn):
+            conn.execute(DEBIT)
+            conn.rollback()
+            conn.execute(CREDIT, (10, 2))  # would commit on its own
+
+        self.server.log.clear()
+        with self.assertRaises(skaidb.OperationalError) as cm:
+            self.conn.transaction(rolls_back)
+        self.assertIn("raise", str(cm.exception))
+        self.assertEqual(self.server.statements, ["BEGIN", DEBIT, "ROLLBACK"])
+        self.assert_usable()
+
+    def test_their_documentation_says_what_they_send(self):
         for method, statement in ((self.conn.commit, "COMMIT"), (self.conn.rollback, "ROLLBACK")):
             with self.subTest(method.__name__):
                 doc = " ".join((method.__doc__ or "").split())
+                self.assertIn(f"``{statement}``", doc)
                 self.assertIn("sends nothing", doc)
                 self.assertIn(":meth:`transaction`", doc)
-                self.assertIn(f'conn.execute("{statement}")', doc)
 
 
 # ---- the pool ---------------------------------------------------------------

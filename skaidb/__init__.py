@@ -657,9 +657,10 @@ class Connection:
     connection. :meth:`transaction` runs one — ``BEGIN``, your statements,
     ``COMMIT`` — and runs it again when the server refuses the commit with a
     :class:`TransactionConflict`; ``BEGIN``/``COMMIT``/``ROLLBACK`` can also
-    be sent as ordinary statements. The DB-API ``commit()`` is an accepted
-    no-op and ``rollback()`` raises, since silently dropping a rollback would
-    be worse than refusing it: neither sends a statement.
+    be sent as ordinary statements, and the connection notes the
+    transaction they open: while it is open a lost connection is not
+    replaced. The DB-API ``commit()`` and ``rollback()`` end that
+    transaction, and send nothing when none is open.
     """
 
     _nonce_counter = 0
@@ -1804,23 +1805,44 @@ class Connection:
                     self._txn_noted = False
 
     def commit(self) -> None:
-        """DB-API ``commit()``: accepted, and sends nothing. It does not
-        commit a transaction opened with ``BEGIN`` — run the transaction
-        with :meth:`transaction`, or send the statement yourself with
-        ``conn.execute("COMMIT")``. Outside a transaction there is nothing
-        to commit: each statement has committed on its own."""
+        """DB-API ``commit()``: commit the transaction open on this
+        connection — one begun with a ``BEGIN`` statement, which the driver
+        has noted — by sending ``COMMIT``, and raise what that raises (a
+        :class:`TransactionConflict` when the server refuses it; after a
+        lost connection, the error that says nothing was committed).
+
+        With no transaction open it is accepted and sends nothing: each
+        statement has committed on its own. So it is safe to call as a
+        matter of routine, as DB-API frameworks do.
+
+        Inside :meth:`transaction` it sends nothing either: the helper
+        commits when the body returns."""
+        if self._txn_noted and not self._txn_open:
+            self.execute("COMMIT")
 
     def rollback(self) -> None:
-        """DB-API ``rollback()``: always raises ``OperationalError``, and
-        sends nothing — a rollback silently dropped would be worse than one
-        refused. To roll a transaction back, raise from the body of
-        :meth:`transaction`, or send the statement yourself with
-        ``conn.execute("ROLLBACK")``."""
-        raise OperationalError(
-            "rollback() sends nothing: roll a transaction back with "
-            'conn.execute("ROLLBACK"), or run it with conn.transaction(), '
-            "which rolls back when its body raises"
-        )
+        """DB-API ``rollback()``: roll back the transaction open on this
+        connection — one begun with a ``BEGIN`` statement, which the driver
+        has noted — by sending ``ROLLBACK``. After a lost connection the
+        transaction is gone already, and it is ended here without a
+        statement.
+
+        With no transaction open it is accepted and sends nothing, as the
+        server accepts a ``ROLLBACK`` with nothing open: there is nothing
+        to roll back — every statement has committed on its own — and the
+        clean-up after a failed ``COMMIT`` or ``BEGIN`` does not replace
+        that error with one of its own.
+
+        Inside :meth:`transaction` it raises ``OperationalError`` and sends
+        nothing: the helper ends its transaction, and a body rolls back by
+        raising."""
+        if self._txn_open:
+            raise OperationalError(
+                "rollback() inside transaction(): the helper ends its "
+                "transaction — raise from the body to roll it back"
+            )
+        if self._txn_noted:
+            self.execute("ROLLBACK")
 
     def close(self) -> None:
         if not self.closed:
