@@ -1011,7 +1011,13 @@ class Connection:
         return self._parse_result(self._roundtrip(bytes(req)))
 
     def _close_prepared(self, stmt_id: int) -> None:
-        """Best-effort free of a server-side prepared slot (it replies Ddl)."""
+        """Best-effort free of a server-side prepared slot (it replies Ddl).
+        On a broken connection there is nothing to free — the slot went with
+        the socket — and nothing is sent: starting a request would re-dial,
+        which would hide the failure from the retry in `_run` and close an
+        id the new session never issued."""
+        if self._broken:
+            return
         req = bytes([_OP_CLOSE]) + struct.pack("<I", stmt_id)
         try:
             self._roundtrip(req)
