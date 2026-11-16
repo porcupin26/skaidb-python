@@ -76,6 +76,13 @@ class Server:
     answered with success named, None on a session that entered none.
     `restart()` closes every open connection, as a restarting server does.
 
+    Each connection has the real server's prepared-statement table: at most
+    `MAX_PREPARED` statements, a slot freed by the close opcode, a prepare
+    beyond that refused. `prepared_open(n)` is the number connection `n`
+    holds now and `prepared_peak` the most any connection ever held; `ops`
+    pairs every statement with the opcode that carried it, and `bound` with
+    the typed parameters of an execute.
+
     `on(sql, *replies)` scripts the answers to the next executions of `sql`
     and `always(sql, reply)` the answer to every later one; a reply is a
     payload, a list of payloads (the frames of a stream), `DROP`, `STALL` or
@@ -84,9 +91,16 @@ class Server:
     acknowledged, a `SELECT` answers one row and anything else is a one-row
     mutation."""
 
+    MAX_PREPARED = 256
+    TABLE_FULL = "too many prepared statements (max 256); close some first"
+
     def __init__(self):
         self.log = []
         self.ran_in = []
+        self.ops = []
+        self.bound = []
+        self.prepared_peak = 0
+        self._prepared_open = {}
         self.connections = 0
         self._open = []
         self._hung_up = set()
@@ -128,6 +142,10 @@ class Server:
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.005)
+
+    def prepared_open(self, number) -> int:
+        with self._lock:
+            return self._prepared_open.get(number, 0)
 
     def restart(self):
         """Close every connection accepted so far; the listener stays."""
@@ -192,7 +210,7 @@ class Server:
         return True
 
     def _serve(self, conn, number):
-        prepared = []  # this connection's prepared statements; the id is the index
+        prepared = {}  # this connection's prepared statements, by slot
         database = None  # the session's database
         while True:
             req = _read_frame(conn)
@@ -201,16 +219,26 @@ class Server:
                     self._hung_up.add(number)
                 return
             op = req[0]
+            if op == skaidb._OP_CLOSE:
+                prepared.pop(struct.unpack_from("<I", req, 1)[0], None)
+                with self._lock:
+                    self._prepared_open[number] = len(prepared)
             if op in (skaidb._OP_CLOSE, skaidb._OP_HELLO):
                 _send(conn, _DDL)
                 continue
             if op == skaidb._OP_PREPARE:
                 sql = self._sql(req, 1)
                 reply = self._scripted(("prepare", sql))
+                if reply is None and len(prepared) >= self.MAX_PREPARED:
+                    reply = _f_error(self.TABLE_FULL)
                 if reply is None:
-                    prepared.append(sql)
+                    slot = next(i for i in range(len(prepared) + 1) if i not in prepared)
+                    prepared[slot] = sql
+                    with self._lock:
+                        self._prepared_open[number] = len(prepared)
+                        self.prepared_peak = max(self.prepared_peak, len(prepared))
                     reply = bytes([skaidb._RESP_PREPARED]) + struct.pack(
-                        "<IH", len(prepared) - 1, sql.count("?")
+                        "<IH", slot, sql.count("?")
                     )
             else:
                 if op in (skaidb._OP_EXECUTE, skaidb._OP_EXECUTE_BATCH):
@@ -220,6 +248,9 @@ class Server:
                 with self._lock:
                     self.log.append((number, sql))
                     self.ran_in.append((database, sql))
+                    self.ops.append((op, sql))
+                    if op == skaidb._OP_EXECUTE:
+                        self.bound.append((sql, self._params(req)))
                 reply = self._scripted(sql)
                 if reply is None:
                     reply = self._default(sql)
@@ -235,6 +266,17 @@ class Server:
                 continue
             for payload in reply if isinstance(reply, list) else [reply]:
                 _send(conn, payload)
+
+    @staticmethod
+    def _params(req) -> list:
+        """The typed parameters of an execute request, decoded."""
+        (count,) = struct.unpack_from("<H", req, 6)
+        pos, values = 8, []
+        for _ in range(count):
+            (n,) = struct.unpack_from("<I", req, pos)
+            values.append(skaidb._decode_value(skaidb._Reader(req[pos + 4 : pos + 4 + n])))
+            pos += 4 + n
+        return values
 
     @staticmethod
     def _sql(req, pos) -> str:

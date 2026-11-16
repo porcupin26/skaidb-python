@@ -1242,14 +1242,19 @@ class Connection:
             stmt_id, nparams, cached = self._prepare(sql)
         except _Unpreparable:
             return self._query(_bind(sql, params), consistency)
-        if len(params) != nparams:
-            raise ProgrammingError(
-                f"statement expects {nparams} parameters, got {len(params)}"
-            )
         try:
+            if len(params) != nparams:
+                raise ProgrammingError(
+                    f"statement expects {nparams} parameters, got {len(params)}"
+                )
             return self._execute_prepared(stmt_id, params, consistency)
         finally:
             if not cached:
+                # Past the cache the statement is not kept, so its slot on
+                # the server is given back whatever became of it — also when
+                # it was never executed: slots that leak fill the server's
+                # table (256 per connection), which then refuses every new
+                # statement.
                 self._close_prepared(stmt_id)
 
     # -- DB-API surface --
@@ -1706,12 +1711,12 @@ class Cursor:
         except _Unpreparable:
             self._executemany_loop(sql, rows)
             return
-        for i, params in enumerate(rows):
-            if len(params) != nparams:
-                raise ProgrammingError(
-                    f"row {i}: statement expects {nparams} parameters, got {len(params)}"
-                )
         try:
+            for i, params in enumerate(rows):
+                if len(params) != nparams:
+                    raise ProgrammingError(
+                        f"row {i}: statement expects {nparams} parameters, got {len(params)}"
+                    )
             kind, a, _ = self.connection._execute_batch(
                 stmt_id, rows, self._consistency
             )
