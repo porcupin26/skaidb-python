@@ -142,9 +142,12 @@ class Server:
             with conn:
                 if self._handshake(conn):
                     self._serve(conn, number)
+                    return
         except OSError:  # reset: the client closed with a reply still unread
-            with self._lock:
-                self._hung_up.add(number)
+            pass
+        # Closed by the client in the middle of the handshake, or reset.
+        with self._lock:
+            self._hung_up.add(number)
 
     @staticmethod
     def _handshake(conn) -> bool:

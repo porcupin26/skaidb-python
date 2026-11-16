@@ -587,7 +587,21 @@ class Connection:
     def _open(self) -> None:
         """Dial the endpoints in order until one connects and authenticates,
         then `USE` the database if one was requested. Raises
-        ``OperationalError`` if no endpoint is reachable."""
+        ``OperationalError`` if no endpoint is reachable.
+
+        A dial that does not finish leaves the connection broken, with no
+        socket — whatever stopped it: no endpoint, a `USE` the server
+        refused (the session is in its default database, not the one asked
+        for), or an interrupt half way through the handshake or before the
+        Hello was acknowledged (see `_exchange`). The next statement then
+        dials again instead of running on a socket that is not ready."""
+        try:
+            self._establish()
+        except BaseException:
+            self._mark_broken()
+            raise
+
+    def _establish(self) -> None:
         errors = []
         for host, port in self._endpoints:
             try:

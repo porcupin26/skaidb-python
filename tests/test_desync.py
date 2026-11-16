@@ -20,14 +20,14 @@ from unittest import mock
 import skaidb
 
 try:
-    from test_stream import _f_chunk, _f_end, _f_header, _f_mutation
+    from test_stream import _f_chunk, _f_end, _f_error, _f_header, _f_mutation
     from test_transactions import (
-        CREDIT, SCAN, STALL, Late, Server, _Case, _credentials, _rows,
+        CREDIT, DROP, SCAN, STALL, Late, Server, _Case, _credentials, _rows,
     )
 except ImportError:  # run as `python -m unittest tests.test_desync`
-    from tests.test_stream import _f_chunk, _f_end, _f_header, _f_mutation
+    from tests.test_stream import _f_chunk, _f_end, _f_error, _f_header, _f_mutation
     from tests.test_transactions import (
-        CREDIT, SCAN, STALL, Late, Server, _Case, _credentials, _rows,
+        CREDIT, DROP, SCAN, STALL, Late, Server, _Case, _credentials, _rows,
     )
 
 NAMES = "SELECT name FROM accounts"
@@ -331,6 +331,101 @@ class Interrupted(unittest.TestCase):
             [("second",)],
             "the next statement was handed the late reply",
         )
+
+
+def _interrupted_dial(exc, after):
+    """Patch the driver so that the read after `after` more frames raises
+    `exc`. A dial reads the AuthChallenge, the AuthOutcome, the Hello
+    acknowledgement and then the reply to `USE`, in that order."""
+    real = skaidb.Connection._read_frame
+    pending = [exc]
+
+    def read_frame(self):
+        nonlocal after
+        if pending:
+            if after == 0:
+                raise pending.pop()
+            after -= 1
+        return real(self)
+
+    return mock.patch.object(skaidb.Connection, "_read_frame", read_frame)
+
+
+class UnfinishedDial(unittest.TestCase):
+    """A re-dial that does not finish — interrupted, refused its database,
+    or with nowhere to connect — leaves the connection broken, with no
+    socket: never one that looks usable half way through the handshake,
+    with an acknowledgement still unread, or outside its database."""
+
+    USE = 'USE "app"'
+    # The frames a dial reads, in order (see `_interrupted_dial`).
+    STEPS = ["the challenge", "the outcome", "the Hello acknowledgement", "the reply to USE"]
+
+    def connected(self):
+        """A fake server and a connection to it, in database `app`."""
+        server = Server()
+        self.addCleanup(server.close)
+        server.always(SECOND, _rows(["v"], [("second",)]))
+        server.always(self.USE, bytes([skaidb._RESP_DDL]))
+        conn = skaidb.connect(**dict(_credentials(server), database="app"))
+        self.addCleanup(conn.close)
+        return server, conn
+
+    def test_an_interrupted_reconnect_does_not_leave_a_half_open_connection(self):
+        for after, step in enumerate(self.STEPS):
+            for make in Interrupted.INTERRUPTS:
+                exc = make()
+                with self.subTest(step, interrupt=type(exc).__name__):
+                    server, conn = self.connected()
+                    with _interrupted_dial(exc, after):
+                        with self.assertRaises(type(exc)) as cm:
+                            conn.reconnect()
+                    self.assertIs(cm.exception, exc)
+                    self.assertFalse(conn.is_usable())
+                    self.assertTrue(server.hung_up(2), "the socket is still open")
+                    # The next statement dials again, and reads its own reply.
+                    self.assertEqual(conn.execute(SECOND).fetchall(), [("second",)])
+                    self.assertEqual(server.log[-2:], [(3, self.USE), (3, SECOND)])
+
+    def test_an_interrupted_automatic_reconnect_is_tried_again(self):
+        # The same when the re-dial is the driver's own: a connection lost
+        # under a statement, and the dial that follows interrupted.
+        for after, step in enumerate(self.STEPS):
+            with self.subTest(step):
+                server, conn = self.connected()
+                server.on(SECOND, DROP)
+                stop = KeyboardInterrupt()
+                with _interrupted_dial(stop, after + 1):  # + the reply that was lost
+                    with self.assertRaises(KeyboardInterrupt) as cm:
+                        conn.execute(SECOND)
+                self.assertIs(cm.exception, stop)
+                self.assertFalse(conn.is_usable())
+                self.assertTrue(server.hung_up(2), "the socket is still open")
+                self.assertEqual(conn.execute(SECOND).fetchall(), [("second",)])
+                self.assertEqual(server.log[-2:], [(3, self.USE), (3, SECOND)])
+
+    def test_a_reconnect_refused_its_database_is_not_left_in_another(self):
+        server, conn = self.connected()
+        server.on(self.USE, _f_error('database "app" does not exist'))
+        with self.assertRaises(skaidb.ProgrammingError) as cm:
+            conn.reconnect()
+        self.assertIn("does not exist", str(cm.exception))
+        self.assertEqual(server.connections, 2)
+        # Authenticated, but in the server's default database: a statement
+        # sent there would read or write the wrong tables.
+        self.assertFalse(conn.is_usable())
+        self.assertTrue(server.hung_up(2), "the socket is still open")
+        self.assertEqual(conn.execute(SECOND).fetchall(), [("second",)])
+        self.assertEqual(server.log[-2:], [(3, self.USE), (3, SECOND)])
+
+    def test_a_reconnect_with_nowhere_to_connect_leaves_the_connection_broken(self):
+        server, conn = self.connected()
+        conn._endpoints = [("127.0.0.1", _closed_port())]
+        with self.assertRaises(skaidb.OperationalError):
+            conn.reconnect()
+        self.assertFalse(conn.is_usable(), "no socket, yet usable")
+        conn._endpoints = [("127.0.0.1", server.port)]
+        self.assertEqual(conn.execute(SECOND).fetchall(), [("second",)])
 
 
 class BrokenClosesTheSocket(unittest.TestCase):
