@@ -30,7 +30,8 @@ GONE = _f_error('database "app" does not exist')
 class UseStatement(unittest.TestCase):
     """Which statements name the session database: exactly one
     `USE [DATABASE] <name>`, the name bare or in double quotes, an optional
-    `;` — the cases of the Rust driver's `used_database`."""
+    `;`, `--` comments skipped as the server skips them — the cases of the
+    Rust driver's `used_database`."""
 
     def test_the_database_a_statement_names(self):
         cases = [
@@ -40,6 +41,21 @@ class UseStatement(unittest.TestCase):
             ('USE "my db"', "my db"),
             ('USE "my-db"', "my-db"),
             ('USE DATABASE "a""b"', 'a"b'),
+            # A comment the server skips: `--` to the end of its line …
+            ("USE app -- the app database", "app"),
+            ("USE app--", "app"),
+            ("-- first\nUSE app;  -- then\n", "app"),
+            ("USE -- the name is on the next line\n app", "app"),
+            # … unless it is inside a quoted name or string.
+            ('USE "a--b"', "a--b"),
+            ('USE "a--b" -- named with dashes', "a--b"),
+            ('USE "a""--b"', 'a"--b'),
+            ("USE -- nothing", None),
+            ("USE -- x", None),
+            ("-- USE app", None),
+            ("SELECT '--' -- then\nUSE app", None),
+            ("SELECT 'USE app -- quoted'", None),
+            ("USE app /* not a comment to the server */", None),
             # A database named `database`, as the server reads it.
             ("USE DATABASE", "DATABASE"),
             ("USE DATABASE DATABASE", "DATABASE"),
@@ -52,7 +68,6 @@ class UseStatement(unittest.TestCase):
             ('USE "', None),
             ("USE 'app'", None),
             ("USE ?", None),
-            ("USE app -- the tenant", None),
             ("SELECT 'USE app'", None),
             ("INSERT INTO t (id) VALUES (1)", None),
             ("", None),
@@ -98,6 +113,21 @@ class AfterARedial(_Case):
             ("a quoted name", lambda conn: conn.execute('USE "my-db"'), "my-db"),
             ("a quote in the name", lambda conn: conn.execute('USE "a""b"'), 'a"b'),
             ("a stream", lambda conn: conn.stream("USE app").close(), "app"),
+            (
+                "a comment after it",
+                lambda conn: conn.execute("USE app -- the app database"),
+                "app",
+            ),
+            (
+                "comments around it",
+                lambda conn: conn.execute("-- first\nUSE app;  -- then\n"),
+                "app",
+            ),
+            (
+                "dashes in a quoted name",
+                lambda conn: conn.execute('USE "a--b" -- named with dashes'),
+                "a--b",
+            ),
         ]
         for name, use, database in ways:
             with self.subTest(name):

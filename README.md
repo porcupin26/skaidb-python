@@ -154,7 +154,8 @@ is sent. If the database cannot be entered on the new connection, the
 statement fails with that error; it never runs in another database. A `USE`
 is recognised when it is the whole statement: `USE [DATABASE] name`, the
 name bare or in double quotes (`""` for a quote inside), with an optional
-trailing `;`.
+trailing `;` — `--` comments around it are skipped, as the server skips
+them.
 
 ### Timeouts
 

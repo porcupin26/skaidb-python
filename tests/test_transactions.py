@@ -260,9 +260,10 @@ class Server:
                     if op == skaidb._OP_EXECUTE:
                         self.bound.append((sql, self._params(req)))
                 reply = self._scripted(sql)
+                read = _without_comments(sql)  # what the server parses
                 if reply is None:
-                    reply = self._default(sql)
-                use = _USE.match(sql)
+                    reply = self._default(read)
+                use = _USE.match(read)
                 if use and reply == _DDL:
                     database = use.group(1).replace('""', '"') if use.group(1) is not None else use.group(2)
             if isinstance(reply, Late):
@@ -300,7 +301,7 @@ class Server:
 
     @staticmethod
     def _default(sql):
-        if sql.split()[0].upper() in ("BEGIN", "COMMIT", "ROLLBACK", "USE"):
+        if sql.split()[:1] and sql.split()[0].upper() in ("BEGIN", "COMMIT", "ROLLBACK", "USE"):
             return _DDL
         if sql.startswith("SELECT"):
             return _rows(["n"], [(1,)])
@@ -312,6 +313,15 @@ class Server:
 _USE = re.compile(
     r'\s*USE\s+(?:DATABASE\s+)?(?:"((?:[^"]|"")+)"|(\w+))\s*;?\s*\Z', re.IGNORECASE
 )
+
+
+def _without_comments(sql) -> str:
+    """`sql` as the server parses it: without its `--` comments, each of
+    which runs to the end of its line — a `--` inside a double-quoted name
+    or a quoted string is not one."""
+    return re.sub(
+        r"""("(?:[^"]|"")*"|'(?:[^']|'')*')|--[^\n]*""", lambda m: m.group(1) or "", sql
+    )
 
 
 def _credentials(server):

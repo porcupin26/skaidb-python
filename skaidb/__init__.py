@@ -481,10 +481,11 @@ def _strip_strings(sql: str) -> str:
 
 def _used_database(sql: str) -> "str | None":
     """The database a ``USE [DATABASE] <name>`` statement names, when `sql`
-    is exactly one such statement (a trailing ``;`` allowed): the name as
-    written, or with its double quotes removed and the doubled quotes inside
-    undone. None for anything else — every driver reads a ``USE`` by these
-    rules (PROTOCOL.md §6 rule 9)."""
+    is exactly one such statement (a trailing ``;`` allowed, ``--`` comments
+    skipped): the name as written, or with its double quotes removed and the
+    doubled quotes inside undone. None for anything else — every driver
+    reads a ``USE`` by these rules (PROTOCOL.md §6 rule 9)."""
+    sql = _without_line_comments(sql)
     rest = _strip_keyword(sql.strip().rstrip(";").rstrip(), "USE")
     if rest is None:
         return None
@@ -500,6 +501,35 @@ def _used_database(sql: str) -> "str | None":
     if rest and all(ch.isalnum() or ch == "_" for ch in rest):
         return rest
     return None
+
+
+def _without_line_comments(sql: str) -> str:
+    """`sql` without its ``--`` comments (each runs to the end of its line),
+    leaving alone a ``--`` inside a double-quoted name or a quoted string.
+    The server accepts ``USE app -- the app database``, and a ``USE`` the
+    driver cannot read is one it does not carry to the next connection."""
+    if "--" not in sql:
+        return sql
+    out = []
+    quote = None
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if quote is not None:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+        elif sql.startswith("--", i):
+            i = sql.find("\n", i)
+            if i < 0:
+                break
+            out.append("\n")
+        else:
+            out.append(ch)
+            if ch in "\"'":
+                quote = ch
+        i += 1
+    return "".join(out)
 
 
 def _strip_keyword(text: str, word: str) -> "str | None":

@@ -201,9 +201,11 @@ never runs in another database.
 
 A statement is read as a `USE` when it is exactly one `USE [DATABASE] <name>`
 — the name bare (letters, digits, `_`) or in double quotes with `""` for a
-quote inside — with an optional trailing `;`, in any letter case. Anything
-else (a comment after it, two statements in one string) is left alone, and
-the connection keeps re-entering the database it knew.
+quote inside — with an optional trailing `;`, in any letter case. `--`
+comments, each running to the end of its line, are skipped as the server
+skips them (`USE app -- the tenant's database`); a `--` inside a quoted name
+is part of the name. Anything else (two statements in one string) is left
+alone, and the connection keeps re-entering the database it knew.
 
 ### Transactions
 
