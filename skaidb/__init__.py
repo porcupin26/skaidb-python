@@ -128,12 +128,32 @@ class TransactionConflict(ProgrammingError):
 _CONFLICT_PREFIX = "transaction conflict:"
 
 
-def _server_error(msg: str) -> ProgrammingError:
+def _server_error(msg: str, batch: bool = False) -> ProgrammingError:
     """The exception for a server ``Error`` frame — a statement error, which
-    leaves the connection usable. `msg` is the server's message, unchanged."""
-    if msg.startswith(_CONFLICT_PREFIX):
+    leaves the connection usable. `msg` is the server's message, unchanged.
+
+    With `batch`, the frame answers an ``ExecuteBatch``: the server names
+    the failing row before that row's error, and the prefix that decides
+    is read past the name (`_batch_row_error`)."""
+    text = _batch_row_error(msg) if batch else msg
+    if text.startswith(_CONFLICT_PREFIX):
         return TransactionConflict(msg)
     return ProgrammingError(msg)
+
+
+def _batch_row_error(msg: str) -> str:
+    """The failing row's own error in the error of a batch — ``batch row
+    <n>: <error> (<k> rows applied before it)`` — from its first character
+    on; `msg` itself when it names no row. So an error is told by its
+    prefix in a batch as anywhere else."""
+    head = "batch row "
+    if msg.startswith(head):
+        i = j = len(head)
+        while j < len(msg) and "0" <= msg[j] <= "9":
+            j += 1
+        if j > i and msg.startswith(": ", j):
+            return msg[j + 2:]
+    return msg
 
 
 # ---- Consistency levels ---------------------------------------------------
@@ -1273,7 +1293,7 @@ class Connection:
         return [Connection._parse_rows(r) for _ in range(r.u32())]
 
     @staticmethod
-    def _parse_result(r: "_Reader"):
+    def _parse_result(r: "_Reader", batch: bool = False):
         tag = r.u8()
         if tag == _RESP_ROWS:
             columns, rows = Connection._parse_rows(r)
@@ -1287,7 +1307,7 @@ class Connection:
         if tag == _RESP_DDL:
             return ("ddl", 0, None)
         if tag == _RESP_ERROR:
-            raise _server_error(r.text())
+            raise _server_error(r.text(), batch)
         raise InterfaceError(f"unknown response tag {tag}")
 
     def _roundtrip(self, req: bytes) -> "_Reader":
@@ -1467,7 +1487,9 @@ class Connection:
         """One round-trip executing a prepared statement once per param row
         (the `executemany` wire op). Returns the parsed result (total
         affected). Raises `ProgrammingError` on a row failure (the server
-        names the failing row; earlier rows stay applied)."""
+        names the failing row before its error; outside a transaction
+        earlier rows stay applied) — the `TransactionConflict` kind when
+        that row's error is one."""
         req = bytearray()
         req.append(_OP_EXECUTE_BATCH)
         req.append(consistency)
@@ -1479,7 +1501,7 @@ class Connection:
                 vb = _encode_value(p)
                 req += struct.pack("<I", len(vb))
                 req += vb
-        return self._parse_result(self._roundtrip(bytes(req)))
+        return self._parse_result(self._roundtrip(bytes(req)), batch=True)
 
     def _close_prepared(self, stmt_id: int) -> None:
         """Best-effort free of a server-side prepared slot (it replies Ddl).

@@ -556,6 +556,50 @@ class ConflictError(_Case):
                     skaidb.TransactionConflict if conflict else skaidb.ProgrammingError,
                 )
 
+    def test_a_conflict_in_a_batch_row_is_one_too(self):
+        # A failed row of an `executemany` batch is named before its error
+        # and counted after it: `batch row 1: <error> (1 rows applied
+        # before it)`. The prefix that decides is the row's error's.
+        batch = "INSERT INTO audit (id) VALUES (?)"
+        named = f"batch row 1: {CONFLICT} (1 rows applied before it)"
+        cases = [
+            (named, True),
+            ("batch row 0: transaction conflict: reworded (0 rows applied before it)", True),
+            ("batch row 1200: transaction conflict:", True),
+            (CONFLICT, True),  # as a server without the batch opcode's rows would say it
+            (
+                'batch row 1: not null violation: column "v" of table "audit" is null '
+                "(1 rows applied before it)",
+                False,
+            ),
+            ("batch row 1: Transaction conflict: another spelling", False),
+            ("batch row 1: a transaction conflict: not at the start of the row's error", False),
+            ("batch row : transaction conflict: no row is named", False),
+            ("batch row x: transaction conflict: no row is named", False),
+            ("batch row 1 transaction conflict: not the server's naming", False),
+            ("row 1: transaction conflict: not the server's naming", False),
+        ]
+        self.server.on(batch, *[_f_error(msg) for msg, _ in cases])
+        cur = self.conn.cursor()
+        for msg, conflict in cases:
+            with self.subTest(msg):
+                with self.assertRaises(skaidb.ProgrammingError) as cm:
+                    cur.executemany(batch, [(1,), (2,)])
+                self.assertEqual(str(cm.exception), msg, "the server's message, unchanged")
+                self.assertIs(
+                    type(cm.exception),
+                    skaidb.TransactionConflict if conflict else skaidb.ProgrammingError,
+                )
+        # Only a batch names a row: the same text answering another
+        # statement starts with something else than the prefix.
+        self.server.on("COMMIT", _f_error(named))
+        self.server.on(CREDIT, _f_error(named))
+        for run in (lambda: self.conn.execute("COMMIT"), lambda: self.conn.execute(CREDIT, (10, 2))):
+            with self.assertRaises(skaidb.ProgrammingError) as cm:
+                run()
+            self.assertIs(type(cm.exception), skaidb.ProgrammingError)
+        self.assert_usable()
+
     def test_every_statement_path_raises_it(self):
         conflict = _f_error(CONFLICT)
         batch = "INSERT INTO audit (id) VALUES (?)"
