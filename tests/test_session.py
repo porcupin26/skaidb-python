@@ -147,6 +147,24 @@ class AfterARedial(_Case):
                 self.lose_the_connection_then_run(conn)
                 self.assertEqual(self.ran_under(), ("ONE", "ROWS 7 BYTES 9"))
 
+    def test_a_setting_sent_with_a_parameter_is_noted_as_it_was_sent(self):
+        # The server does not prepare a SET (`statement kind cannot be
+        # prepared: …`), so the value is written into the text — and that
+        # text, not the one with the `?`, is what the server accepted.
+        conn = self.connect()
+        conn.execute("SET SCAN BUDGET ROWS ?", (7,))
+        conn.cursor().executemany("SET CONSISTENCY ALL", [()])
+        self.assertEqual(self.ran_under_after(conn), ("ALL", "ROWS 7"))
+        self.assertEqual(
+            self.lose_the_connection_then_run(conn),
+            ["SET CONSISTENCY ALL", "SET SCAN BUDGET ROWS 7", COUNT],
+        )
+        self.assertEqual(self.ran_under(), ("ALL", "ROWS 7"))
+
+    def ran_under_after(self, conn):
+        conn.execute(COUNT)
+        return self.ran_under()
+
     def test_the_last_setting_of_each_kind_wins(self):
         conn = self.connect()
         for sql in (ALL, BUDGET, "SET CONSISTENCY ONE", "SET SCAN BUDGET BYTES 4096"):
