@@ -636,6 +636,10 @@ class Connection:
                 pass
         self._file = None
         self._sock = None
+        # A stream was in flight on that socket and on no other: its
+        # `RowStream` sees the socket gone (`RowStream._stale`) and neither
+        # reads nor releases anything from here on.
+        self._streaming = False
 
     def _send_hello(self) -> None:
         """Best-effort self-identification (fills the server's ``drivers``
@@ -1300,6 +1304,12 @@ class RowStream:
     already sent, and so does dropping the last reference. `columns` carries
     the result's column names, which arrive in the header before any row.
 
+    A stream belongs to the socket it was opened on. Once the connection has
+    closed that socket or re-dialed (`close()`, `reconnect()`, the automatic
+    reconnect after a failure) the rest of the result is gone: iterating
+    past the rows already received raises `OperationalError`, and `close()`
+    does nothing — it never reads the connection's next socket.
+
     A `CALL` whose procedure body `EMIT`s result sets is answered with all of
     them in one frame, streamed or not: such a stream owns nothing, starts on
     the first set, and `nextset()` walks the rest as `Cursor.nextset()` does.
@@ -1308,6 +1318,8 @@ class RowStream:
     def __init__(self, conn: Connection, columns: List[str], affected: int, done: bool,
                  sets: "Optional[list]" = None):
         self._conn = conn
+        # The read side of the socket the frames arrive on (see `_stale`).
+        self._file = conn._file
         self.columns = columns
         # Rows affected, when the statement turned out to be a mutation.
         self.affected = affected
@@ -1349,17 +1361,31 @@ class RowStream:
         self._rows = iter(rows)
         return True
 
+    def _stale(self) -> bool:
+        """True once the connection is no longer on the socket this stream
+        was opened on: it was closed, or re-dialed. What the connection reads
+        now is another statement's reply, and the claim on it — if any —
+        another stream's."""
+        return self._conn._file is not self._file
+
     def _finish(self) -> None:
         """Mark the exchange over and hand the connection back. Idempotent,
         because close() and the iterator both reach it."""
         self._done = True
         if not self._released:
             self._released = True
-            self._conn._stream_release()
+            if not self._stale():
+                self._conn._stream_release()
 
     def _next_frame(self) -> None:
         """Read the next stream frame into the row buffer, or end the stream."""
         conn = self._conn
+        if self._stale():
+            self._finish()
+            raise OperationalError(
+                "the connection this stream was reading was closed or "
+                "re-dialed; the rest of its result is lost"
+            )
         try:
             fr = _Reader(conn._read_frame())
             t = fr.u8()
@@ -1413,13 +1439,17 @@ class RowStream:
         second bound: a peer that is alive but silent blocks this call
         forever. That is the same exposure every other read on the
         connection has under that setting, and the reason the default is not
-        `None`."""
+        `None`.
+
+        Nothing is read once the connection has closed or re-dialed the
+        socket the stream was opened on: the frames there now are not this
+        stream's."""
         if self._released:
             return
         self._rows = iter(())
         conn = self._conn
-        # Nothing to drain if the stream ran out or the socket is already gone.
-        if not self._done and not conn.closed:
+        # Nothing to drain if the stream ran out or its socket is gone.
+        if not self._done and not self._stale():
             try:
                 for _ in range(_STREAM_DRAIN_MAX_FRAMES):
                     payload = conn._read_frame()
