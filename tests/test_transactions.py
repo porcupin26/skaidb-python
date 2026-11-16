@@ -73,12 +73,16 @@ class Server:
     on, `connections` counts the connections accepted and `hung_up(n)`
     tells whether the client has closed connection `n`. `ran_in` pairs each
     statement with the database its session was in — the one the last `USE`
-    answered with success named, None on a session that entered none.
+    answered with success named, None on a session that entered none — and
+    `ran_under` with the session's settings: the level of the last `SET
+    CONSISTENCY` and the limits of the last `SET SCAN BUDGET` answered with
+    success, None for one never set or cleared with `DEFAULT`.
     `restart()` closes every open connection, as a restarting server does.
 
     Each connection has the real server's prepared-statement table: at most
     `MAX_PREPARED` statements, a slot freed by the close opcode, a prepare
-    beyond that refused. `prepared_open(n)` is the number connection `n`
+    beyond that refused — and one of transaction or session control refused
+    as a kind that cannot be prepared. `prepared_open(n)` is the number connection `n`
     holds now and `prepared_peak` the most any connection ever held; `ops`
     pairs every statement with the opcode that carried it, and `bound` with
     the typed parameters of an execute. An execute naming a slot the
@@ -88,7 +92,7 @@ class Server:
     and `always(sql, reply)` the answer to every later one; a reply is a
     payload, a list of payloads (the frames of a stream), `DROP`, `STALL` or
     a `Late` one of those.
-    Unscripted, `BEGIN …` / `COMMIT` / `ROLLBACK` / `USE …` are
+    Unscripted, `BEGIN …` / `COMMIT` / `ROLLBACK` / `USE …` / `SET …` are
     acknowledged, a `SELECT` answers one row and anything else is a one-row
     mutation."""
 
@@ -98,6 +102,7 @@ class Server:
     def __init__(self):
         self.log = []
         self.ran_in = []
+        self.ran_under = []
         self.ops = []
         self.bound = []
         self.unknown_ids = []
@@ -214,6 +219,7 @@ class Server:
     def _serve(self, conn, number):
         prepared = {}  # this connection's prepared statements, by slot
         database = None  # the session's database
+        settings = {"CONSISTENCY": None, "SCAN BUDGET": None}  # and its settings
         while True:
             req = _read_frame(conn)
             if req is None:  # the client closed the connection
@@ -231,6 +237,8 @@ class Server:
             if op == skaidb._OP_PREPARE:
                 sql = self._sql(req, 1)
                 reply = self._scripted(("prepare", sql))
+                if reply is None and self._session_control(_without_comments(sql)):
+                    reply = _f_error("statement kind cannot be prepared")
                 if reply is None and len(prepared) >= self.MAX_PREPARED:
                     reply = _f_error(self.TABLE_FULL)
                 if reply is None:
@@ -256,6 +264,7 @@ class Server:
                 with self._lock:
                     self.log.append((number, sql))
                     self.ran_in.append((database, sql))
+                    self.ran_under.append((settings["CONSISTENCY"], settings["SCAN BUDGET"], sql))
                     self.ops.append((op, sql))
                     if op == skaidb._OP_EXECUTE:
                         self.bound.append((sql, self._params(req)))
@@ -266,6 +275,11 @@ class Server:
                 use = _USE.match(read)
                 if use and reply == _DDL:
                     database = use.group(1).replace('""', '"') if use.group(1) is not None else use.group(2)
+                setting = _SET.match(read)
+                if setting and reply == _DDL:
+                    kind = " ".join(setting.group(1).upper().split())
+                    value = " ".join(setting.group(2).upper().split())
+                    settings[kind] = None if value == "DEFAULT" else value
             if isinstance(reply, Late):
                 time.sleep(reply.delay)
                 reply = reply.reply
@@ -300,8 +314,16 @@ class Server:
             return self._always.get(key)
 
     @staticmethod
-    def _default(sql):
-        if sql.split()[:1] and sql.split()[0].upper() in ("BEGIN", "COMMIT", "ROLLBACK", "USE"):
+    def _session_control(sql) -> bool:
+        """Whether `sql` is transaction or session control: acknowledged,
+        and — as on the real server — a kind that cannot be prepared."""
+        return sql.split()[:1] != [] and sql.split()[0].rstrip(";").upper() in (
+            "BEGIN", "COMMIT", "ROLLBACK", "USE", "SET",
+        )
+
+    @classmethod
+    def _default(cls, sql):
+        if cls._session_control(sql):
             return _DDL
         if sql.startswith("SELECT"):
             return _rows(["n"], [(1,)])
@@ -312,6 +334,13 @@ class Server:
 # quotes (group 1, `""` for a quote inside) or bare (group 2).
 _USE = re.compile(
     r'\s*USE\s+(?:DATABASE\s+)?(?:"((?:[^"]|"")+)"|(\w+))\s*;?\s*\Z', re.IGNORECASE
+)
+
+
+# What it reads as `SET CONSISTENCY <level>` or `SET SCAN BUDGET <limits>`:
+# the setting (group 1) and what it is set to (group 2).
+_SET = re.compile(
+    r"\s*SET\s+(CONSISTENCY|SCAN\s+BUDGET)\s+(.*?)\s*;?\s*\Z", re.IGNORECASE | re.DOTALL
 )
 
 

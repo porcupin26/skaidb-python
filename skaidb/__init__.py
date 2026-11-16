@@ -541,6 +541,55 @@ def _strip_keyword(text: str, word: str) -> "str | None":
     return None
 
 
+# ---- The session's state ----------------------------------------------------
+
+# The first word of every statement the driver notes (`_session_statement`).
+_SESSION_WORDS = frozenset(("USE", "SET"))
+
+
+def _session_statement(sql: str) -> "tuple[str, str | None] | None":
+    """What `sql` does to the state of its session, when it is exactly one
+    statement that the driver notes — a session's state lives on the
+    connection, so the driver keeps a note of it and puts it back on every
+    later dial (PROTOCOL.md §6 rule 9). `(kind, value)`:
+
+    * ``("use", database)`` — ``USE [DATABASE] <name>`` (`_used_database`);
+    * ``("consistency", text)`` — ``SET CONSISTENCY …``: `text` is the
+      statement, comments and the trailing ``;`` stripped, to send again;
+      None when the level is ``DEFAULT``, which clears the override;
+    * ``("scan_budget", text)`` — ``SET SCAN BUDGET …``, the same way.
+
+    None for anything else: the driver reads the first words and no
+    further, and leaves alone what is not exactly one such statement."""
+    i, n = 0, len(sql)
+    while i < n and sql[i].isspace():
+        i += 1
+    if not sql.startswith("--", i):
+        # Any other statement is told apart by its first word, without a
+        # pass over its text.
+        j = i
+        while j < n and j - i < 9 and sql[j].isalpha():
+            j += 1
+        if sql[i:j].upper() not in _SESSION_WORDS:
+            return None
+    database = _used_database(sql)
+    if database is not None:
+        return ("use", database)
+    text = _without_line_comments(sql).strip()
+    if text.endswith(";"):
+        text = text[:-1].rstrip()
+    words = [w.upper() if w.isascii() else "" for w in text.split(None, 4)[:4]]
+    if words[:2] == ["SET", "CONSISTENCY"]:
+        kind, level = "consistency", words[2:3]
+    elif words[:3] == ["SET", "SCAN", "BUDGET"]:
+        kind, level = "scan_budget", words[3:4]
+    else:
+        return None
+    if ";" in text:  # more than one statement
+        return None
+    return (kind, None if level == ["DEFAULT"] else text)
+
+
 # ---- SCRAM-SHA-256 handshake (§2) -----------------------------------------
 
 
@@ -585,6 +634,8 @@ class Connection:
     _cert_auth = False
     _connected = None
     _database = None
+    _session_consistency = None
+    _session_scan_budget = None
     # The pool that owns this connection (see `ConnectionPool`): told each
     # round trip's latency, each transport failure and each write, and asked
     # for the dial order when the connection re-dials. None outside a pool.
@@ -645,9 +696,17 @@ class Connection:
         self._read_timeout = read_timeout
         # The database the session is in, as far as the driver knows: the
         # one asked for here, then the one named by the last `USE` the
-        # server answered with success (`_note_database`). Every dial enters
+        # server answered with success (`_note_session`). Every dial enters
         # it before anything else is sent — a new session starts in none.
         self._database = database
+        # The session's other settings, noted the same way: the last
+        # `SET CONSISTENCY …` and the last `SET SCAN BUDGET …` the server
+        # accepted, as the statement to send again on every dial; None when
+        # there is none, or once `… DEFAULT` cleared it. A new session has
+        # neither: without the note a statement after a re-dial would read
+        # at another consistency, or past the limit the application set.
+        self._session_consistency: "str | None" = None
+        self._session_scan_budget: "str | None" = None
         self._tls_ctx = tls_ctx
         self._tls_server_name = tls_server_name
         self._sock = None
@@ -656,15 +715,17 @@ class Connection:
 
     def _open(self) -> None:
         """Dial the endpoints in order until one connects and authenticates,
-        then `USE` the database if one was requested. Raises
+        then put the session's state back (`_restore_session`): its
+        database, its consistency override, its scan budget. Raises
         ``OperationalError`` if no endpoint is reachable.
 
         A dial that does not finish leaves the connection broken, with no
-        socket — whatever stopped it: no endpoint, a `USE` the server
-        refused (the session is in its default database, not the one asked
-        for), or an interrupt half way through the handshake or before the
-        Hello was acknowledged (see `_exchange`). The next statement then
-        dials again instead of running on a socket that is not ready."""
+        socket — whatever stopped it: no endpoint, a `USE` or a setting the
+        server refused (the session is in its default database, or under
+        its default settings, not the ones asked for), or an interrupt half
+        way through the handshake or before the Hello was acknowledged (see
+        `_exchange`). The next statement then dials again instead of
+        running on a socket that is not ready."""
         try:
             self._establish()
         except BaseException:
@@ -707,8 +768,7 @@ class Connection:
             self._streaming = False
             self._prepared.clear()
             self._send_hello()
-            if self._database is not None:
-                self._use_database(self._database)
+            self._restore_session()
             return
         raise OperationalError("could not connect to any endpoint (" + "; ".join(errors) + ")")
 
@@ -757,6 +817,19 @@ class Connection:
             self._read_frame()  # Ddl ack, or an old server's Error — either way, done.
         except (OSError, OperationalError):
             pass
+
+    def _restore_session(self) -> None:
+        """Put the state of the session back on a connection just dialed,
+        before anything else is sent on it: the database, then the noted
+        `SET CONSISTENCY`, then the noted `SET SCAN BUDGET` — each only if
+        there is one. A statement the server refuses here is raised, and
+        the dial has not finished (`_open`): no statement runs in another
+        database, or under other settings, than the application set."""
+        if self._database is not None:
+            self._use_database(self._database)
+        for setting in (self._session_consistency, self._session_scan_budget):
+            if setting is not None:
+                self._query(setting, self._consistency)
 
     def _use_database(self, db: str) -> None:
         """Enter `db`, and remember it as the session's database."""
@@ -1015,16 +1088,27 @@ class Connection:
         if self._observer is not None and _is_write(sql):
             self._observer._wrote(self)
 
-    def _note_database(self, sql: str) -> None:
-        """A statement succeeded: if it was a ``USE``, its database is the
-        session's from now on, and the one every later dial of this
-        connection enters (`_open`). Sent as an ordinary statement it used
-        to be the server's knowledge alone: after a re-dial the session was
-        in no database, and the next statement ran against whatever table of
-        that name the default database holds."""
-        database = _used_database(sql)
-        if database is not None:
-            self._database = database
+    def _note_session(self, sql: str) -> None:
+        """The server answered `sql` with success: if it changed the state
+        of the session (`_session_statement`), note what every later dial
+        of this connection must put back (`_restore_session`) — the
+        database a ``USE`` entered, the ``SET CONSISTENCY`` or ``SET SCAN
+        BUDGET`` in force (none once ``… DEFAULT`` cleared it). Sent as
+        ordinary statements they used to be the server's knowledge alone:
+        after a re-dial the session was in no database and under no
+        setting, and the next statement ran against whatever table of that
+        name the default database holds, at the request's own consistency
+        and with no scan limit."""
+        noted = _session_statement(sql)
+        if noted is None:
+            return
+        kind, value = noted
+        if kind == "use":
+            self._database = value
+        elif kind == "consistency":
+            self._session_consistency = value
+        elif kind == "scan_budget":
+            self._session_scan_budget = value
 
     def _check_ready(self) -> None:
         """Refuse to start a request on a connection that cannot carry one.
@@ -1056,7 +1140,12 @@ class Connection:
     def _query(self, sql: str, consistency: int):
         body = sql.encode("utf-8")
         req = bytes([_OP_QUERY, consistency]) + struct.pack("<I", len(body)) + body
-        return self._parse_result(self._roundtrip(req))
+        result = self._parse_result(self._roundtrip(req))
+        # Noted here, where the text is the one that was sent: a statement
+        # with parameters the server does not prepare arrives through
+        # `_execute_params` with its values written in.
+        self._note_session(sql)
+        return result
 
     # -- prepared statements (OP_PREPARE / OP_EXECUTE / OP_CLOSE) --
     def _prepare(self, sql: str) -> "tuple[int, int, bool]":
@@ -1217,7 +1306,7 @@ class Connection:
                     raise ProgrammingError(f"server does not support {what}: {msg}")
                 raise _server_error(msg)
             if tag in (_RESP_MUTATION, _RESP_DDL):
-                self._note_database(sql)  # a USE, answered with success
+                self._note_session(sql)  # a USE or a SET, answered with success
             if tag == _RESP_MUTATION:
                 # Not a row-producing statement: one ordinary frame is the
                 # whole reply, so the stream is empty and already finished.
@@ -1709,7 +1798,6 @@ class Cursor:
             text = _bind(sql, None)
             kind, a, b = conn._run(lambda: conn._query(text, self._consistency))
         conn._note_statement(sql)
-        conn._note_database(sql)
         self._result_sets = []
         if kind == "sets":
             self._result_sets = list(a)
@@ -1882,7 +1970,9 @@ def connect(
     any seed serves any request. ``database`` issues ``USE <database>`` as part
     of connecting, so the session starts in the right database; the
     connection enters its database again on every re-dial — this one, or the
-    one named by the last ``USE`` statement the server accepted. ``timeout`` is
+    one named by the last ``USE`` statement the server accepted — and sends
+    again the last ``SET CONSISTENCY`` and ``SET SCAN BUDGET`` statements
+    the server accepted, unless ``… DEFAULT`` cleared them. ``timeout`` is
     the default for both dial and reads; ``connect_timeout`` / ``read_timeout``
     override each independently (a read timeout can then sit above the server's
     statement timeout without also slowing dial failures).
