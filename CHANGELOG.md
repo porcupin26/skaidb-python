@@ -4,6 +4,103 @@ All notable changes to the skaidb Python driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.1] - 2026-11-16
+
+### Fixed
+- **A statement interrupted between its request and its reply no longer
+  hands that reply to the next statement.** A `KeyboardInterrupt`, a
+  `SystemExit` or any other exception raised by a signal handler, a green
+  thread's timeout — anything but a socket error — left the reply unread on
+  a connection that still looked healthy, and replies carry no request id:
+  the next statement got the interrupted one's rows, and every statement
+  after it the reply of the one before. Whatever stops a round trip now
+  marks the connection broken and closes its socket, then propagates
+  unchanged; the next statement re-dials as after any transport failure.
+  This covers `execute()`, `executemany()`, `stream()` and its iteration
+  (including an interrupt while a chunk is decoded, which used to skip the
+  chunk's rows), the drain in `RowStream.close()`, and a `reconnect()`
+  interrupted half way through the handshake. `stream()` also no longer
+  releases the connection as healthy when the header frame cannot be parsed.
+- **The session database survives a re-dial when a `USE` statement set
+  it.** Only the `database=` given to `connect()` was entered again on a new
+  connection. After `conn.execute("USE app")` and a failover — the member
+  restarted while the client was idle — the new session was in no database,
+  and the next statement ran against the default database's table of the
+  same name. The connection now remembers the database of the last `USE` the
+  server accepted (`USE [DATABASE] name`, the name bare or in double quotes,
+  an optional `;`; `--` comments around it are skipped, as the server skips
+  them, so `USE app -- the app database` counts too) and enters it on every
+  later dial before anything else is sent.
+- **A re-dial that does not finish leaves the connection broken.** When the
+  server refused the `USE` on a new connection (the database dropped
+  meanwhile), the error was raised once and the connection then stayed open
+  in the default database, where the following statements ran. It is now
+  closed, and each statement fails with the server's error until the
+  database can be entered: a statement never runs in another database. The
+  same holds for a `reconnect()` with no endpoint to reach, after which
+  `is_usable()` stayed `True`.
+- **A connection marked broken closes its socket at once**, not at the next
+  statement or at `close()`. After a read timeout the server is alive and
+  kept the session — with a transaction open in it, or the rest of a stream
+  it was still sending — for as long as the application held the connection
+  unused. The same for a `RowStream` left open by the body of
+  `transaction()`: its transaction could be neither committed nor rolled
+  back, and stayed open on the server.
+- **A `RowStream` reads only the socket it was opened on.** After
+  `conn.reconnect()` with a stream still alive, closing or dropping the old
+  stream drained the NEW socket — it waited out the read timeout and marked
+  the healthy connection broken, or swallowed the rows of a stream opened
+  since — and iterating it yielded the new statement's rows. A stream whose
+  connection was closed or re-dialed now raises `OperationalError` once the
+  rows it had already received are used up, and closing it does nothing.
+- **A cached prepared statement is never sent by an id of an earlier
+  connection.** The first parameterised statement after a failure the driver
+  does not retry on the spot (a stream that lost its connection, a statement
+  inside `transaction()`, an abandoned stream too long to drain) failed with
+  `unknown prepared statement id N`: it re-dialed, then sent the id it had
+  cached on the connection that was gone. The cache now goes with the
+  socket, and the statement is prepared again before it runs.
+- **The server's prepared-statement table no longer fills after parameter
+  errors.** A statement beyond the 240 the connection caches is closed after
+  its one use — except when it was given the wrong number of parameters,
+  which left its slot taken on the server. Sixteen of those and every
+  statement the connection had not cached was refused with `too many
+  prepared statements (max 256); close some first`.
+- **A statement beyond the prepared-statement cache fails over like any
+  other.** When its connection failed, closing the statement re-dialed and
+  the failed statement was then not retried: `execute()` and `executemany()`
+  raised `OperationalError` on a failover every cached statement survives.
+- **`conn.reconnect()` inside `transaction()` no longer applies half a
+  transaction.** A body that answered a lost connection by re-dialing ran
+  its remaining statements on a session with no transaction, each
+  committing on its own, while the statements before the loss were gone;
+  the helper then sent its `COMMIT` there. `reconnect()` now raises
+  `ProgrammingError` while `transaction()` has its transaction open: the
+  error ends the transaction, and the caller runs it again.
+- **`conn.rollback()` no longer says the database has no transactions.** It
+  raised "skaidb does not support rollback (auto-commit only)". The DB-API
+  `commit()` and `rollback()` still send nothing — `commit()` is accepted,
+  `rollback()` raises `OperationalError` — and now say so, and name what
+  ends a transaction: `conn.transaction()`, or `conn.execute("COMMIT")` /
+  `conn.execute("ROLLBACK")`.
+
+### Changed
+- A pool made with `database=` hands every connection out in that database.
+  One a borrower left in another database with a `USE` is put back with one
+  round trip at its next checkout (or replaced if that fails); before, the
+  next borrower ran in the last borrower's database. A pool made without
+  `database=` has none to restore: a connection stays where its last
+  borrower took it.
+
+### Documentation
+- `docs/api.md` shows `connect()` with `tls_client_cert`, `tls_client_key`,
+  `auth_mechanism` and `auto_reconnect`, and `stream()` with `params`;
+  `docs/pooling.md` describes the retry the driver does on its own
+  (`auto_reconnect`) instead of saying there is none; the README no longer
+  says the driver presents no client certificate. New sections describe
+  broken connections and the session database. `docs/changelog.md` points
+  to this file.
+
 ## [1.5.0] - 2026-11-15
 
 ### Added
