@@ -583,6 +583,48 @@ class OneConnection(_Case):
         self.assertEqual(self.server.statements, ["BEGIN", DEBIT], "no COMMIT on a fresh connection")
         self.assertEqual(self.server.connections, 1)
 
+    def test_nothing_of_the_body_follows_a_lost_connection_onto_a_fresh_one(self):
+        # PROTOCOL.md §6 rule 7, the whole of it: a statement succeeds, the
+        # connection is lost under the next one, the body swallows that
+        # error, tries a write, swallows that too and returns normally.
+        audit = "INSERT INTO audit (id) VALUES (1)"
+        writes = [
+            ("a statement", lambda conn: conn.execute(audit)),
+            ("a prepared statement", lambda conn: conn.execute(CREDIT, (10, 3))),
+            ("executemany", lambda conn: conn.cursor().executemany(CREDIT, [(10, 3), (10, 4)])),
+            ("a stream", lambda conn: conn.stream(audit)),
+        ]
+        for name, write in writes:
+            with self.subTest(name):
+                server = Server()
+                self.addCleanup(server.close)
+                conn = skaidb.connect(**_credentials(server))
+                self.addCleanup(conn.close)
+                server.on(DEBIT, DROP)
+                raised = []
+
+                def body(conn):
+                    conn.execute(CREDIT, (10, 2))  # statement 1: succeeds
+                    for statement in (lambda conn: conn.execute(DEBIT), write):
+                        try:
+                            statement(conn)  # 2: the connection is lost; 3: a write
+                        except skaidb.OperationalError as e:
+                            raised.append(e)
+                    return "done"
+
+                with self.assertRaises(skaidb.OperationalError) as cm:
+                    conn.transaction(body)
+                self.assertEqual(len(raised), 2, "statement 2 raised, and statement 3 too")
+                # Statement 3 was not sent, and neither COMMIT nor ROLLBACK
+                # went to a session that never had the transaction.
+                self.assertEqual(server.log, [(1, "BEGIN"), (1, CREDIT), (1, DEBIT)])
+                self.assertEqual(server.connections, 1)
+                self.assertNotIn("nothing was committed", str(cm.exception))
+                # The same connection carries ordinary statements again, as
+                # after any lost connection.
+                self.assertEqual(conn.execute("SELECT 1").fetchall(), [(1,)])
+                self.assertEqual(server.log[-1], (2, "SELECT 1"))
+
     def test_the_body_cannot_redial_its_way_out_of_the_transaction(self):
         # A body that answers the loss with reconnect() would run the rest
         # of its statements on a session with no transaction — each one
@@ -632,11 +674,14 @@ class OneConnection(_Case):
             runs.append(1)
             conn.execute(DEBIT)
 
-        with self.assertRaises(skaidb.OperationalError):
+        with self.assertRaises(skaidb.OperationalError) as cm:
             self.conn.transaction(body)
         self.assertEqual(len(runs), 1)
         self.assertEqual(self.server.statements, ["BEGIN", DEBIT, "COMMIT"])
         self.assertEqual(self.server.connections, 1)
+        # The server may have applied it before its reply went missing: the
+        # error says the connection was lost, and claims neither outcome.
+        self.assertNotIn("nothing was committed", str(cm.exception))
 
     def test_a_read_timeout_in_the_body_ends_the_session_at_once(self):
         # The server is alive and still holds the session with its open
@@ -824,6 +869,16 @@ class Pool(unittest.TestCase):
         self.assertEqual(self.server.statements, ["BEGIN", DEBIT])
         self.assertEqual(self.server.connections, 1)
         self.assertEqual(self.counts(), (0, 0), "the broken connection was closed")
+
+    def test_a_begin_on_a_pooled_connection_lost_while_idle_redials_like_any_statement(self):
+        with self.pool.connection() as conn:
+            conn.execute("SELECT 1")
+        self.server.restart()  # the idle connection is gone; the pool cannot tell yet
+        self.assertEqual(self.pool.transaction(lambda conn: conn.execute(DEBIT).rowcount), 1)
+        # The BEGIN that found the connection dead was sent again on a new
+        # one, and the whole transaction ran there.
+        self.assertEqual(self.server.log[1:], [(2, "BEGIN"), (2, DEBIT), (2, "COMMIT")])
+        self.assertEqual(self.counts(), (0, 1), "the re-dialed connection went back to the pool")
 
     def test_attempts_below_one_is_refused_before_a_connection_is_taken(self):
         with self.assertRaises(ValueError):
