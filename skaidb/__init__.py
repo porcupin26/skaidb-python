@@ -374,6 +374,25 @@ _BUSY_STREAMING = (
 )
 
 
+# A connection lost with a transaction open on it (PROTOCOL.md §6 rule 7):
+# the transaction went with the connection, and nothing of it is sent on
+# another.
+_LOST_IN_TRANSACTION = (
+    "connection lost inside a transaction: the transaction ended with the "
+    "connection and nothing of it was committed; this statement was not "
+    "sent. ROLLBACK ends the transaction here — then run it again"
+)
+_LOST_BEFORE_COMMIT = (
+    "connection lost inside the transaction: nothing was committed — the "
+    "transaction ended with the connection, and COMMIT was not sent; run "
+    "the transaction again"
+)
+_LOST_UNDER_COMMIT = (
+    "connection lost under COMMIT: the outcome is unknown — the server may "
+    "have committed the transaction before its reply went missing"
+)
+
+
 class _Unpreparable(Exception):
     """Internal: the server reported a statement kind that cannot be prepared
     (DDL / session control). The caller falls back to client-side text binding."""
@@ -545,7 +564,7 @@ def _strip_keyword(text: str, word: str) -> "str | None":
 # ---- The session's state ----------------------------------------------------
 
 # The first word of every statement the driver notes (`_session_statement`).
-_SESSION_WORDS = frozenset(("USE", "SET"))
+_SESSION_WORDS = frozenset(("USE", "SET", "BEGIN", "COMMIT", "ROLLBACK"))
 
 
 def _session_statement(sql: str) -> "tuple[str, str | None] | None":
@@ -558,7 +577,12 @@ def _session_statement(sql: str) -> "tuple[str, str | None] | None":
     * ``("consistency", text)`` — ``SET CONSISTENCY …``: `text` is the
       statement, comments and the trailing ``;`` stripped, to send again;
       None when the level is ``DEFAULT``, which clears the override;
-    * ``("scan_budget", text)`` — ``SET SCAN BUDGET …``, the same way.
+    * ``("scan_budget", text)`` — ``SET SCAN BUDGET …``, the same way;
+    * ``("begin", None)`` — a statement whose first word is ``BEGIN``
+      (``BEGIN``, ``BEGIN TRANSACTION``, ``BEGIN ATOMIC …``): it opens a
+      transaction, which lives on the connection too (rule 7);
+    * ``("commit", None)`` / ``("rollback", None)`` — exactly ``COMMIT
+      [TRANSACTION]`` / ``ROLLBACK [TRANSACTION]``, which end it.
 
     None for anything else: the driver reads the first words and no
     further, and leaves alone what is not exactly one such statement."""
@@ -580,6 +604,11 @@ def _session_statement(sql: str) -> "tuple[str, str | None] | None":
     if text.endswith(";"):
         text = text[:-1].rstrip()
     words = [w.upper() if w.isascii() else "" for w in text.split(None, 4)[:4]]
+    if words[:1] == ["BEGIN"]:
+        return ("begin", None)
+    for end in ("COMMIT", "ROLLBACK"):
+        if words in ([end], [end, "TRANSACTION"]):
+            return (end.lower(), None)
     if words[:2] == ["SET", "CONSISTENCY"]:
         kind, level = "consistency", words[2:3]
     elif words[:3] == ["SET", "SCAN", "BUDGET"]:
@@ -642,6 +671,11 @@ class Connection:
     # True while `transaction()` has a transaction open here. The transaction
     # lives on this socket, so nothing re-dials meanwhile (see `_run`).
     _txn_open = False
+    # True while a transaction the driver has noted is open here: from a
+    # `BEGIN` the server accepted until `COMMIT` or `ROLLBACK` is answered
+    # (`_note_session`) — whoever sent them, the application or
+    # `transaction()`.
+    _txn_noted = False
     # An instance built without __init__ wires its own transport and cannot
     # be re-dialed, so it does not auto-reconnect.
     _auto_reconnect = False
@@ -726,6 +760,10 @@ class Connection:
         # at another consistency, or past the limit the application set.
         self._session_consistency: "str | None" = None
         self._session_scan_budget: "str | None" = None
+        # And a transaction, which is not put back: a connection lost while
+        # one is open is not replaced until the application has ended it
+        # (`_lost_before`).
+        self._txn_noted = False
         self._tls_ctx = tls_ctx
         self._tls_server_name = tls_server_name
         self._sock = None
@@ -895,6 +933,14 @@ class Connection:
                 "that follow would each commit on their own; let the error "
                 "end the transaction and run it again"
             )
+        if self._txn_noted:
+            raise ProgrammingError(
+                "reconnect() with a transaction open: the transaction is on "
+                "the connection it began on, and on a new one the statements "
+                "that follow would each commit on their own; end it first "
+                "(ROLLBACK — answered here once the connection is lost) and "
+                "run it again"
+            )
         # Try every OTHER endpoint before the one that just failed: a member
         # going down during a rolling restart still accepts a connect for a
         # moment, and re-dialing it first lost the retry (and an 8-hour
@@ -1043,10 +1089,11 @@ class Connection:
         error of what cannot be put back. It never runs outside the
         database, or the settings, the driver has noted."""
         noted = _session_statement(sql)
-        outer, self._stating = self._stating, noted[0] if noted else None
+        what = noted[0] if noted else None
+        outer, self._stating = self._stating, what
         try:
             self._look()
-            yield
+            yield what
         except BaseException:
             if self._unrestored:
                 self._mark_broken()
@@ -1071,19 +1118,73 @@ class Connection:
         Inside :meth:`transaction` the failure always surfaces: on a fresh
         connection the statement would run outside the transaction and
         commit on its own."""
-        with self._statement(sql):
+        with self._statement(sql) as what:
+            if self._lost_before(what):
+                return ("ddl", 0, None)  # ROLLBACK, answered here
             try:
                 return fn()
-            except OperationalError:
+            except OperationalError as e:
+                if self._in_transaction():
+                    if self._broken and self._lost_under(what, e):
+                        return ("ddl", 0, None)
+                    raise
                 if (
                     not (self._auto_reconnect and self._broken)
                     or self.closed
                     or self._streaming
-                    or self._txn_open
                 ):
                     raise
                 self.reconnect()
                 return fn()
+
+    def _in_transaction(self) -> bool:
+        """Whether a transaction is open on this connection, as far as the
+        driver knows: one it noted (`_txn_noted`), or `transaction()`'s."""
+        return self._txn_noted or self._txn_open
+
+    def _lost_before(self, what: "str | None") -> bool:
+        """The statement of kind `what` is about to be sent: is this a
+        connection lost with a transaction open (PROTOCOL.md §6 rule 7)?
+        Then nothing is sent — on this connection or on a new one, where
+        the statement would commit on its own — and the application ends
+        the transaction here:
+
+        * its ``ROLLBACK`` is answered with success (True is returned):
+          the server discarded the transaction with the connection;
+        * its ``COMMIT`` fails, saying that nothing was committed;
+        * anything else fails with the connection-lost error.
+
+        Either end clears the note, and the next statement dials again as
+        after any lost connection. False when there is nothing of the
+        kind, and the statement goes out."""
+        if not (self._broken and self._in_transaction()) or self.closed:
+            return False
+        if what == "rollback":
+            self._txn_noted = False
+            return True
+        if what == "commit":
+            self._txn_noted = False
+            raise OperationalError(_LOST_BEFORE_COMMIT)
+        raise OperationalError(_LOST_IN_TRANSACTION)
+
+    def _lost_under(self, what: "str | None", error: OperationalError) -> bool:
+        """The connection was lost under a statement of kind `what` with a
+        transaction open. It is not replaced, and the statement is not sent
+        again. Under the ``COMMIT`` itself the outcome is unknown — the
+        server may have applied it before its reply went missing — and the
+        error raised says so; under the ``ROLLBACK`` the transaction is
+        gone either way, which is what was asked (True is returned). Both
+        end the transaction. Under any other statement False is returned
+        and the caller raises `error`: nothing was committed, and the
+        transaction stays noted until the application ends it
+        (`_lost_before`)."""
+        if what == "commit":
+            self._txn_noted = False
+            raise OperationalError(f"{_LOST_UNDER_COMMIT} ({error})") from error
+        if what == "rollback":
+            self._txn_noted = False
+            return True
+        return False
 
     # -- handshake --
     def _handshake_certificate(self, user: str) -> None:
@@ -1230,22 +1331,38 @@ class Connection:
         if self._observer is not None and _is_write(sql):
             self._observer._wrote(self)
 
-    def _note_session(self, sql: str) -> None:
-        """The server answered `sql` with success: if it changed the state
-        of the session (`_session_statement`), note what every later dial
-        of this connection must put back (`_restore_session`) — the
+    def _note_session(self, sql: str, refused: bool = False) -> None:
+        """The server answered `sql` — with success, or with an error if
+        `refused`: if the statement changes the state of the session
+        (`_session_statement`), note it.
+
+        What a statement answered with success set is what every later
+        dial of this connection puts back (`_restore_session`) — the
         database a ``USE`` entered, the ``SET CONSISTENCY`` or ``SET SCAN
         BUDGET`` in force (none once ``… DEFAULT`` cleared it). Sent as
         ordinary statements they used to be the server's knowledge alone:
         after a re-dial the session was in no database and under no
         setting, and the next statement ran against whatever table of that
         name the default database holds, at the request's own consistency
-        and with no scan limit."""
+        and with no scan limit.
+
+        A transaction is noted too, from a ``BEGIN`` answered with success
+        until its ``COMMIT`` or ``ROLLBACK`` is answered at all. It is not
+        put back — it cannot be: while one is open the connection is not
+        replaced (`_run`, `_check_ready`)."""
         noted = _session_statement(sql)
         if noted is None:
             return
         kind, value = noted
-        if kind == "use":
+        if kind in ("commit", "rollback"):
+            # Answered: the transaction is over, also when the answer is an
+            # error — a refused COMMIT has ended it too (rule 6).
+            self._txn_noted = False
+        elif refused:
+            return
+        elif kind == "begin":
+            self._txn_noted = True
+        elif kind == "use":
             self._database = value
         elif kind == "consistency":
             self._session_consistency = value
@@ -1260,15 +1377,13 @@ class Connection:
         back, which is far more confusing than an error here."""
         if self.closed:
             raise ProgrammingError("connection is closed")
-        if (
-            self._broken
-            and self._auto_reconnect
-            and not self._streaming
-            and not self._txn_open
-        ):
+        if self._broken and self._in_transaction():
+            # The transaction died with the old socket: on a new one this
+            # request would run outside it, and commit on its own.
+            raise OperationalError(_LOST_IN_TRANSACTION)
+        if self._broken and self._auto_reconnect and not self._streaming:
             # Nothing of this request has been sent: re-dialing first is
-            # always safe — except inside `transaction()`, whose transaction
-            # died with the old socket.
+            # always safe.
             self.reconnect()
         if self._broken:
             raise OperationalError(
@@ -1282,10 +1397,15 @@ class Connection:
     def _query(self, sql: str, consistency: int):
         body = sql.encode("utf-8")
         req = bytes([_OP_QUERY, consistency]) + struct.pack("<I", len(body)) + body
-        result = self._parse_result(self._roundtrip(req))
+        r = self._roundtrip(req)
         # Noted here, where the text is the one that was sent: a statement
         # with parameters the server does not prepare arrives through
         # `_execute_params` with its values written in.
+        try:
+            result = self._parse_result(r)
+        except ProgrammingError:  # the server's Error frame
+            self._note_session(sql, refused=True)
+            raise
         self._note_session(sql)
         return result
 
@@ -1433,8 +1553,15 @@ class Connection:
             req = bytes(req)
         else:
             req = bytes([_OP_QUERY_STREAM, level]) + struct.pack("<I", len(body)) + body
-        with self._statement(sql):
-            return self._stream(sql, req, bool(params))
+        with self._statement(sql) as what:
+            if self._lost_before(what):
+                return RowStream(self, [], 0, done=True)  # ROLLBACK, answered here
+            try:
+                return self._stream(sql, req, bool(params))
+            except OperationalError as e:
+                if self._in_transaction() and self._broken and self._lost_under(what, e):
+                    return RowStream(self, [], 0, done=True)
+                raise
 
     def _stream(self, sql: str, req: bytes, parameterised: bool) -> "RowStream":
         """Send the stream request `req` for `sql` and make the
@@ -1449,12 +1576,13 @@ class Connection:
             whole = tag in (_RESP_ERROR, _RESP_MUTATION, _RESP_DDL, _RESP_RESULT_SETS)
             if tag == _RESP_ERROR:
                 msg = r.text()
+                self._note_session(sql, refused=True)
                 if "unknown opcode" in msg:
                     what = "parameterised streaming (skaidb >= 0.330)" if parameterised else "streaming"
                     raise ProgrammingError(f"server does not support {what}: {msg}")
                 raise _server_error(msg)
             if tag in (_RESP_MUTATION, _RESP_DDL):
-                self._note_session(sql)  # a USE or a SET, answered with success
+                self._note_session(sql)  # session or transaction control, accepted
             if tag == _RESP_MUTATION:
                 # Not a row-producing statement: one ordinary frame is the
                 # whole reply, so the stream is empty and already finished.
@@ -1669,6 +1797,11 @@ class Connection:
                     # this socket: it must not carry another statement, and
                     # closing it is what ends the transaction on the server.
                     self._mark_broken()
+                if self._broken:
+                    # Whatever cost the connection ended the transaction
+                    # with it, and this call is what reports that: the
+                    # connection dials again at its next statement.
+                    self._txn_noted = False
 
     def commit(self) -> None:
         """DB-API ``commit()``: accepted, and sends nothing. It does not
@@ -1970,7 +2103,12 @@ class Cursor:
         if not rows:
             self.rowcount = 0
             return
-        self.connection._run(sql, lambda: self._executemany_once(sql, rows))
+        if _session_statement(sql) is not None:
+            # Session and transaction control is never prepared: one
+            # statement per row, each handled as `execute` handles it.
+            self._executemany_loop(sql, rows)
+        else:
+            self.connection._run(sql, lambda: self._executemany_once(sql, rows))
         self.connection._note_statement(sql)
 
     def _executemany_once(self, sql: str, rows: "list[list[Any]]") -> None:

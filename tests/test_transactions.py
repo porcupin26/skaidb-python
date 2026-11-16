@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import os
 import re
+import select
 import shutil
 import socket
 import ssl
@@ -823,7 +824,12 @@ class OneConnection(_Case):
                 # went to a session that never had the transaction.
                 self.assertEqual(server.log, [(1, "BEGIN"), (1, CREDIT), (1, DEBIT)])
                 self.assertEqual(server.connections, 1)
-                self.assertNotIn("nothing was committed", str(cm.exception))
+                # The loss was under a statement of the body, so the COMMIT
+                # was never sent and the error can say what that means.
+                # (Lost under the COMMIT itself it must not:
+                # test_a_connection_lost_at_commit_is_not_retried.)
+                self.assertIn("connection lost", str(cm.exception))
+                self.assertIn("nothing was committed", str(cm.exception))
                 # The same connection carries ordinary statements again, as
                 # after any lost connection.
                 self.assertEqual(conn.execute("SELECT 1").fetchall(), [(1,)])
@@ -970,6 +976,359 @@ class OneConnection(_Case):
                 before = self.server.connections
                 self.assertEqual(self.conn.execute("SELECT 1").fetchall(), [(1,)])
                 self.assertEqual(self.server.connections, before + 1)
+
+
+# ---- a transaction the application writes itself ------------------------------
+
+
+ROW = "INSERT INTO audit (id) VALUES (%d)"
+BATCH = "INSERT INTO audit (id) VALUES (?)"
+
+
+class HandWritten(_Case):
+    """A `BEGIN` the application sends itself opens a transaction like the
+    helper's: the driver notes it — from a `BEGIN` the server accepted
+    until `COMMIT` or `ROLLBACK` is answered — and while it is open
+    PROTOCOL.md §6 rule 7 holds. A lost connection is not replaced: on a
+    new session the rest of the transaction, and its `COMMIT`, would each
+    commit on their own."""
+
+    def lost_after_row_1(self):
+        """`BEGIN`, row 1, and the connection is lost under row 2."""
+        self.conn.execute("BEGIN")
+        self.conn.execute(ROW % 1)
+        self.server.on(ROW % 2, DROP)
+        with self.assertRaises(skaidb.OperationalError):
+            self.conn.execute(ROW % 2)
+        return [(1, "BEGIN"), (1, ROW % 1), (1, ROW % 2)]
+
+    def test_without_a_loss_it_is_the_statements_as_written(self):
+        self.conn.execute("BEGIN")
+        self.conn.execute(ROW % 1)
+        self.conn.execute(CREDIT, (10, 2))
+        self.conn.execute("COMMIT")
+        self.assertEqual(self.server.statements, ["BEGIN", ROW % 1, CREDIT, "COMMIT"])
+        self.assert_usable()
+
+    def test_nothing_follows_a_lost_connection_onto_a_new_session(self):
+        sent = self.lost_after_row_1()
+        # Row 3 fails too, and is not sent — whichever way it is written.
+        writes = [
+            ("a statement", lambda conn: conn.execute(ROW % 3)),
+            ("a prepared statement", lambda conn: conn.execute(BATCH, (3,))),
+            ("executemany", lambda conn: conn.cursor().executemany(BATCH, [(3,), (4,)])),
+            ("a stream", lambda conn: conn.stream(ROW % 3)),
+            ("a read", lambda conn: conn.execute(SCAN)),
+        ]
+        for name, write in writes:
+            with self.subTest(name):
+                with self.assertRaises(skaidb.OperationalError) as cm:
+                    write(self.conn)
+                self.assertIn("connection lost inside a transaction", str(cm.exception))
+        # The COMMIT fails, and is not sent: it would reach a session that
+        # has no transaction.
+        with self.assertRaises(skaidb.OperationalError) as cm:
+            self.conn.execute("COMMIT")
+        self.assertIn("connection lost", str(cm.exception))
+        self.assertIn("nothing was committed", str(cm.exception))
+        self.assertEqual(self.server.log, sent)
+        self.assertEqual(self.server.connections, 1, "a new session was dialed for the transaction")
+        # It ended the transaction: the next statement dials again, as
+        # after any lost connection.
+        self.assertEqual(self.conn.execute("SELECT 1").fetchall(), [(1,)])
+        self.assertEqual(self.server.log, sent + [(2, "SELECT 1")])
+
+    def test_rollback_after_the_loss_succeeds_and_is_not_sent(self):
+        for name, rollback in (
+            ("execute", lambda conn: conn.execute("ROLLBACK").rowcount),
+            ("a spelling", lambda conn: conn.execute("rollback transaction; -- give up").rowcount),
+            ("a stream", lambda conn: list(conn.stream("ROLLBACK"))),
+            ("executemany", lambda conn: conn.cursor().executemany("ROLLBACK", [()])),
+        ):
+            with self.subTest(name):
+                self.server = Server()
+                self.addCleanup(self.server.close)
+                self.conn = skaidb.connect(**_credentials(self.server))
+                self.addCleanup(self.conn.close)
+                sent = self.lost_after_row_1()
+                # The server discarded the transaction with the connection.
+                self.assertIn(rollback(self.conn), (-1, [], None))
+                self.assertEqual(self.server.log, sent)
+                self.assertEqual(self.server.connections, 1)
+                self.assertEqual(self.conn.execute("SELECT 1").fetchall(), [(1,)])
+                self.assertEqual(self.server.log, sent + [(2, "SELECT 1")])
+
+    def test_the_session_is_put_back_once_the_transaction_has_been_ended(self):
+        self.conn.execute("USE app")
+        self.conn.execute("SET SCAN BUDGET ROWS 1")
+        self.lost_after_row_1()
+        self.conn.execute("ROLLBACK")
+        self.conn.execute(SCAN)
+        self.assertEqual(
+            [sql for n, sql in self.server.log if n == 2],
+            ['USE "app"', "SET SCAN BUDGET ROWS 1", SCAN],
+        )
+
+    def test_a_connection_lost_under_the_commit_itself_is_an_unknown_outcome(self):
+        self.conn.execute("BEGIN")
+        self.conn.execute(ROW % 1)
+        self.server.on("COMMIT", DROP)
+        with self.assertRaises(skaidb.OperationalError) as cm:
+            self.conn.execute("COMMIT")
+        # The server may have applied it before its reply went missing.
+        self.assertIn("outcome is unknown", str(cm.exception))
+        self.assertNotIn("nothing was committed", str(cm.exception))
+        self.assertEqual(self.server.statements, ["BEGIN", ROW % 1, "COMMIT"], "sent again")
+        self.assertEqual(self.server.connections, 1)
+        # The transaction is over either way.
+        self.assertEqual(self.conn.execute("SELECT 1").fetchall(), [(1,)])
+        self.assertEqual(self.server.log[-1], (2, "SELECT 1"))
+
+    def test_a_connection_lost_under_the_rollback_itself_has_rolled_back(self):
+        self.conn.execute("BEGIN")
+        self.conn.execute(ROW % 1)
+        self.server.on("ROLLBACK", DROP)
+        self.assertEqual(self.conn.execute("ROLLBACK").rowcount, -1)
+        self.assertEqual(self.server.statements, ["BEGIN", ROW % 1, "ROLLBACK"], "sent again")
+        self.assertEqual(self.server.connections, 1)
+        self.assertEqual(self.conn.execute("SELECT 1").fetchall(), [(1,)])
+        self.assertEqual(self.server.log[-1], (2, "SELECT 1"))
+
+    def test_a_connection_that_died_while_idle_is_a_lost_transaction_not_a_redial(self):
+        # The look that replaces an idle connection its peer closed
+        # (tests/test_idle.py) finds this one dead too — and reports it.
+        self.conn.execute("BEGIN")
+        self.server.on(ROW % 1, Then(_f_mutation(1), HALF_CLOSE))
+        self.conn.execute(ROW % 1)
+        select.select([self.conn._sock], [], [], 5)
+        for statement in (ROW % 2, ROW % 3):
+            with self.assertRaises(skaidb.OperationalError) as cm:
+                self.conn.execute(statement)
+            self.assertIn("connection lost inside a transaction", str(cm.exception))
+        self.assertEqual(self.server.discarded(1), b"", "written to the dead connection")
+        self.assertEqual(self.server.connections, 1)
+        self.assertEqual(self.conn.execute("ROLLBACK").rowcount, -1)
+        self.assertEqual(self.conn.execute("SELECT 1").fetchall(), [(1,)])
+        self.assertEqual(self.server.log, [(1, "BEGIN"), (1, ROW % 1), (2, "SELECT 1")])
+
+    def test_every_spelling_of_begin_opens_it(self):
+        begins = [
+            ("BEGIN", lambda conn, sql: conn.execute(sql)),
+            ("begin;", lambda conn, sql: conn.execute(sql)),
+            ("BEGIN TRANSACTION", lambda conn, sql: conn.execute(sql)),
+            ("BEGIN ATOMIC PARTITION (tenant = 7)", lambda conn, sql: conn.execute(sql)),
+            ("-- the transfer\nBEGIN -- now\n", lambda conn, sql: conn.execute(sql)),
+            ("BEGIN", lambda conn, sql: conn.stream(sql).close()),
+            ("BEGIN", lambda conn, sql: conn.cursor().executemany(sql, [()])),
+            ("BEGIN ATOMIC PARTITION (tenant = ?)", lambda conn, sql: conn.execute(sql, (7,))),
+        ]
+        for begin, send in begins:
+            with self.subTest(begin, how=send.__code__.co_names[-1]):
+                server = Server()
+                self.addCleanup(server.close)
+                conn = skaidb.connect(**_credentials(server))
+                self.addCleanup(conn.close)
+                send(conn, begin)
+                server.on(DEBIT, DROP)
+                with self.assertRaises(skaidb.OperationalError):
+                    conn.execute(DEBIT)
+                self.assertEqual(server.connections, 1, "re-dialed inside the transaction")
+                self.assertEqual(server.statements.count(DEBIT), 1)
+
+    def test_commit_and_rollback_end_it(self):
+        ends = [
+            ("COMMIT", lambda conn, sql: conn.execute(sql)),
+            ("commit transaction;", lambda conn, sql: conn.execute(sql)),
+            ("COMMIT -- done", lambda conn, sql: conn.execute(sql)),
+            ("ROLLBACK", lambda conn, sql: conn.execute(sql)),
+            ("Rollback  Transaction", lambda conn, sql: conn.execute(sql)),
+            ("COMMIT", lambda conn, sql: conn.stream(sql).close()),
+            ("ROLLBACK", lambda conn, sql: conn.cursor().executemany(sql, [()])),
+        ]
+        for end, send in ends:
+            with self.subTest(end, how=send.__code__.co_names[-1]):
+                server = Server()
+                self.addCleanup(server.close)
+                conn = skaidb.connect(**_credentials(server))
+                self.addCleanup(conn.close)
+                conn.execute("BEGIN")
+                conn.execute(ROW % 1)
+                send(conn, end)
+                # Outside a transaction a lost connection is replaced, and
+                # the statement runs.
+                server.on(DEBIT, DROP)
+                self.assertEqual(conn.execute(DEBIT).rowcount, 1)
+                self.assertEqual(server.log[-2:], [(1, DEBIT), (2, DEBIT)])
+
+    def test_a_refused_commit_or_rollback_has_ended_it_too(self):
+        for end, error in (
+            ("COMMIT", CONFLICT),
+            ("COMMIT", "constraint violated: balance >= 0"),
+            ("ROLLBACK", "no transaction in progress"),
+        ):
+            for how, send in (
+                ("execute", lambda conn, sql: conn.execute(sql)),
+                ("a stream", lambda conn, sql: conn.stream(sql)),
+            ):
+                with self.subTest(end, error=error, how=how):
+                    server = Server()
+                    self.addCleanup(server.close)
+                    conn = skaidb.connect(**_credentials(server))
+                    self.addCleanup(conn.close)
+                    conn.execute("BEGIN")
+                    server.on(end, _f_error(error))
+                    with self.assertRaises(skaidb.ProgrammingError):
+                        send(conn, end)
+                    server.on(DEBIT, DROP)
+                    self.assertEqual(conn.execute(DEBIT).rowcount, 1)
+                    self.assertEqual(server.connections, 2)
+
+    def test_a_refused_begin_opens_nothing(self):
+        self.server.on("BEGIN", _f_error("a transaction is already in progress"))
+        with self.assertRaises(skaidb.ProgrammingError):
+            self.conn.execute("BEGIN")
+        self.server.on(DEBIT, DROP)
+        self.assertEqual(self.conn.execute(DEBIT).rowcount, 1)
+        self.assertEqual(self.server.connections, 2)
+
+    def test_what_is_not_its_end_leaves_it_open(self):
+        self.server.always("SELECT 'COMMIT'", _rows(["v"], [("COMMIT",)]))
+        self.server.on("COMMIT WORK", _f_error("parse error"))
+        self.server.on(DEBIT, _f_error("no such table accounts"))
+        self.conn.execute("BEGIN")
+        self.conn.execute("SELECT 'COMMIT'")
+        self.conn.execute("ROLLBACK TO SAVEPOINT a")  # not `ROLLBACK [TRANSACTION]`
+        for refused in ("COMMIT WORK", DEBIT):  # a statement error ends nothing
+            with self.assertRaises(skaidb.ProgrammingError):
+                self.conn.execute(refused)
+        self.server.on(CREDIT, DROP)
+        with self.assertRaises(skaidb.OperationalError):
+            self.conn.execute(CREDIT, (10, 2))
+        self.assertEqual(self.server.connections, 1, "re-dialed inside the transaction")
+
+    def test_a_commit_that_could_not_be_sent_leaves_it_open(self):
+        # A stream owns the connection: the COMMIT is refused before it is
+        # written, and the transaction is still open on the server.
+        self.server.always(SCAN, [_f_header(["id"]), _f_chunk([(1,)]), _f_end()])
+        self.conn.execute("BEGIN")
+        rows = self.conn.stream(SCAN)
+        with self.assertRaises(skaidb.ProgrammingError) as cm:
+            self.conn.execute("COMMIT")
+        self.assertIn("busy streaming", str(cm.exception))
+        self.assertEqual(list(rows), [(1,)])
+        self.server.on(DEBIT, DROP)
+        with self.assertRaises(skaidb.OperationalError):
+            self.conn.execute(DEBIT)
+        self.assertEqual(self.server.connections, 1, "re-dialed inside the transaction")
+
+    def test_reconnect_is_refused_while_it_is_open(self):
+        self.conn.execute("BEGIN")
+        self.conn.execute(ROW % 1)
+        with self.assertRaises(skaidb.ProgrammingError) as cm:
+            self.conn.reconnect()
+        self.assertIn("transaction open", str(cm.exception))
+        self.assertEqual(self.server.connections, 1)
+        # Still on its socket: it can be ended there.
+        self.conn.execute("ROLLBACK")
+        self.assertEqual(self.server.log, [(1, "BEGIN"), (1, ROW % 1), (1, "ROLLBACK")])
+        self.conn.reconnect()
+        self.assertEqual(self.server.connections, 2)
+
+    def test_reconnect_is_refused_after_the_loss_until_the_transaction_is_ended(self):
+        self.lost_after_row_1()
+        with self.assertRaises(skaidb.ProgrammingError):
+            self.conn.reconnect()
+        self.assertEqual(self.server.connections, 1)
+        self.conn.execute("ROLLBACK")
+        self.conn.reconnect()
+        self.assertEqual(self.conn.execute("SELECT 1").fetchall(), [(1,)])
+
+    def test_without_automatic_reconnect_the_same_holds(self):
+        conn = skaidb.connect(**dict(_credentials(self.server), auto_reconnect=False))
+        self.addCleanup(conn.close)
+        self.server.log.clear()
+        conn.execute("BEGIN")
+        self.server.on(ROW % 1, DROP)
+        with self.assertRaises(skaidb.OperationalError):
+            conn.execute(ROW % 1)
+        with self.assertRaises(skaidb.OperationalError) as cm:
+            conn.execute(ROW % 2)
+        self.assertIn("connection lost inside a transaction", str(cm.exception))
+        self.assertEqual(conn.execute("ROLLBACK").rowcount, -1)
+        # The transaction is over; the connection is as after any loss.
+        with self.assertRaises(skaidb.OperationalError) as cm:
+            conn.execute("SELECT 1")
+        self.assertIn("reconnect()", str(cm.exception))
+        conn.reconnect()
+        self.assertEqual(conn.execute("SELECT 1").fetchall(), [(1,)])
+        self.assertEqual(self.server.log, [(2, "BEGIN"), (2, ROW % 1), (3, "SELECT 1")])
+
+    def test_the_helper_notes_its_own_transaction_once(self):
+        # Its BEGIN and COMMIT are statements like any other: noted, ended.
+        self.conn.transaction(lambda conn: conn.execute(DEBIT))
+        self.assertFalse(self.conn._txn_noted)
+        self.server.on(DEBIT, DROP)
+        self.assertEqual(self.conn.execute(DEBIT).rowcount, 1, "left noted open by the helper")
+        self.assertEqual(self.server.connections, 2)
+        # And a body that fails, or loses its connection, leaves none behind.
+        with self.assertRaises(RuntimeError):
+            self.conn.transaction(lambda conn: (_ for _ in ()).throw(RuntimeError("boom")))
+        self.assertFalse(self.conn._txn_noted)
+        self.server.on(DEBIT, DROP)
+        with self.assertRaises(skaidb.OperationalError):
+            self.conn.transaction(lambda conn: conn.execute(DEBIT))
+        self.assertFalse(self.conn._txn_noted)
+        self.assertEqual(self.conn.execute("SELECT 1").fetchall(), [(1,)])
+
+    def test_the_helper_does_not_run_inside_a_transaction_that_is_lost(self):
+        self.lost_after_row_1()
+        ran = []
+        with self.assertRaises(skaidb.OperationalError):
+            self.conn.transaction(lambda conn: ran.append(1))
+        self.assertEqual(ran, [])
+        self.assertEqual(self.server.connections, 1)
+
+
+class TransactionStatements(unittest.TestCase):
+    """Which statements open and end the transaction the driver notes: one
+    whose first word is `BEGIN`; exactly `COMMIT [TRANSACTION]` or
+    `ROLLBACK [TRANSACTION]` — any case, an optional `;`, `--` comments
+    skipped."""
+
+    def test_the_statements_that_open_and_end_a_transaction(self):
+        cases = [
+            ("BEGIN", "begin"),
+            ("begin;", "begin"),
+            ("  Begin  ;\n", "begin"),
+            ("BEGIN TRANSACTION", "begin"),
+            ("BEGIN ATOMIC", "begin"),
+            ("BEGIN ATOMIC PARTITION (tenant = 'a;b')", "begin"),
+            ("-- the transfer\nBEGIN -- now", "begin"),
+            ("COMMIT", "commit"),
+            ("commit ;", "commit"),
+            ("COMMIT TRANSACTION", "commit"),
+            ("commit\ntransaction; -- done", "commit"),
+            ("ROLLBACK", "rollback"),
+            ("rollback;", "rollback"),
+            ("ROLLBACK TRANSACTION;", "rollback"),
+            ("BEGINNING", None),
+            ("BEGIN;SELECT 1", None),
+            ("COMMIT WORK", None),
+            ("COMMIT TRANSACTION now", None),
+            ("COMMIT; BEGIN", None),
+            ("COMMITTED", None),
+            ("ROLLBACK TO SAVEPOINT a", None),
+            ("ROLLBACK; ROLLBACK", None),
+            ("-- COMMIT", None),
+            ("SELECT 'COMMIT'", None),
+            ("CALL commit()", None),
+            ("START TRANSACTION", None),
+            ("END", None),
+        ]
+        for sql, want in cases:
+            with self.subTest(sql):
+                noted = skaidb._session_statement(sql)
+                self.assertEqual(noted and noted[0], want)
 
 
 # ---- the DB-API methods -----------------------------------------------------
