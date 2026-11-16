@@ -606,7 +606,7 @@ class Connection:
         self._streaming = False
         # sql text -> (prepared_id, nparams) for this connection. Ids are
         # per-connection slot indices assigned by the server, so the cache is
-        # cleared whenever the underlying socket is (re)dialed.
+        # emptied whenever the socket is dropped (`_drop_socket`).
         self._prepared: "dict[str, tuple[int, int]]" = {}
         self._endpoints: List[Tuple[str, int]] = list(endpoints)
         self._user = user
@@ -695,6 +695,12 @@ class Connection:
         # `RowStream` sees the socket gone (`RowStream._stale`) and neither
         # reads nor releases anything from here on.
         self._streaming = False
+        # Prepared ids are slots of the session that socket carried: on the
+        # next one they are unknown, or name whatever was prepared there
+        # since. Emptied here rather than at the next dial, because the
+        # statement that re-dials a broken connection looks its id up first
+        # (`_execute_params`) and would send the old one to the new session.
+        self._prepared.clear()
 
     def _mark_broken(self) -> None:
         """The socket is dead or out of step with the server: mark the

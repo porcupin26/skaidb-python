@@ -175,5 +175,104 @@ class RefusedPrepare(_Case):
         self.assertEqual(len(self.conn._prepared), 1)
 
 
+# A and B take the same number of parameters and do different things.
+UPDATE = "UPDATE t SET v = ? WHERE id = ?"
+DELETE = "DELETE FROM t WHERE v = ? AND id = ?"
+SCAN = "SELECT id FROM t"
+
+
+class AfterARedial(_Case):
+    """A prepared statement's id is a slot on the connection that prepared
+    it. On a new connection the same number is unknown, or names another
+    statement prepared there since — so no id crosses a re-dial: the
+    connection's cache is emptied with the socket, and a statement is
+    prepared again before it runs. The fake server resolves every execute
+    through its own table, so a statement run under a stale id would show
+    up as the other statement, or in `unknown_ids`."""
+
+    def prepare_both(self, conn):
+        conn.execute(UPDATE, ("warm", 9))  # slot 0
+        conn.execute(DELETE, ("warm", 9))  # slot 1
+        self.assertEqual(conn._prepared, {UPDATE: (0, 2), DELETE: (1, 2)})
+        del self.server.bound[:]
+
+    def assert_each_ran_as_itself(self, conn):
+        """B first — it takes the first slot of the new connection — then A,
+        cached before the loss."""
+        self.assertEqual(conn.execute(DELETE, ("old", 1)).rowcount, 1)
+        self.assertEqual(conn.execute(UPDATE, ("new", 2)).rowcount, 1)
+        self.assertEqual(self.server.bound, [(DELETE, ["old", 1]), (UPDATE, ["new", 2])])
+        self.assertEqual(self.server.unknown_ids, [], "an id of the old connection was sent")
+        self.assertEqual(conn._prepared, {DELETE: (0, 2), UPDATE: (1, 2)})
+
+    def test_a_connection_lost_while_idle(self):
+        self.prepare_both(self.conn)
+        self.server.restart()
+        self.assert_each_ran_as_itself(self.conn)
+        self.assertEqual(self.server.connections, 2)
+
+    def test_a_connection_already_marked_broken(self):
+        # Broken by a statement that is not retried (a stream): the next
+        # statement re-dials before it is sent, and must not send the id it
+        # found in the cache of the connection that is gone.
+        self.prepare_both(self.conn)
+        self.server.on(SCAN, DROP)
+        with self.assertRaises(skaidb.OperationalError):
+            self.conn.stream(SCAN)
+        self.assertFalse(self.conn.is_usable())
+        self.assert_each_ran_as_itself(self.conn)
+        self.assertEqual(self.server.connections, 2)
+
+    def test_executemany_on_a_connection_already_marked_broken(self):
+        self.prepare_both(self.conn)
+        self.server.on(SCAN, DROP)
+        with self.assertRaises(skaidb.OperationalError):
+            self.conn.stream(SCAN)
+        cur = self.conn.cursor()
+        cur.executemany(DELETE, [("old", 1), ("old", 2)])
+        self.assertEqual(self.server.ops[-1], (skaidb._OP_EXECUTE_BATCH, DELETE))
+        self.assertEqual(self.server.unknown_ids, [])
+
+    def test_a_reconnect_by_hand(self):
+        for auto in (True, False):
+            with self.subTest(auto_reconnect=auto):
+                server = Server()
+                self.addCleanup(server.close)
+                conn = skaidb.connect(**dict(_credentials(server), auto_reconnect=auto))
+                self.addCleanup(conn.close)
+                self.server = server
+                self.prepare_both(conn)
+                conn.reconnect()
+                self.assertEqual(conn._prepared, {})
+                self.assert_each_ran_as_itself(conn)
+
+    def test_without_automatic_reconnect_the_cache_goes_with_the_socket(self):
+        conn = skaidb.connect(**dict(_credentials(self.server), auto_reconnect=False))
+        self.addCleanup(conn.close)
+        self.prepare_both(conn)
+        self.server.restart()
+        with self.assertRaises(skaidb.OperationalError):
+            conn.execute(DELETE, ("old", 1))
+        self.assertEqual(conn._prepared, {}, "ids of a socket that is closed")
+        conn.reconnect()
+        self.assert_each_ran_as_itself(conn)
+
+    def test_each_pooled_connection_prepares_for_itself(self):
+        pool = skaidb.pool(**_credentials(self.server))
+        self.addCleanup(pool.close)
+        first, second = pool.getconn(), pool.getconn()
+        first.execute(UPDATE, ("warm", 9))  # slot 0 of its connection
+        second.execute(DELETE, ("old", 1))  # slot 0 of the other one
+        second.execute(UPDATE, ("new", 2))
+        first.execute(DELETE, ("old", 3))
+        self.assertEqual(
+            self.server.bound,
+            [(UPDATE, ["warm", 9]), (DELETE, ["old", 1]), (UPDATE, ["new", 2]), (DELETE, ["old", 3])],
+        )
+        self.assertEqual(self.server.unknown_ids, [])
+        pool.putconn(first)
+        pool.putconn(second)
+
+
 if __name__ == "__main__":
     unittest.main()

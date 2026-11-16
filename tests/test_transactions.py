@@ -81,7 +81,8 @@ class Server:
     beyond that refused. `prepared_open(n)` is the number connection `n`
     holds now and `prepared_peak` the most any connection ever held; `ops`
     pairs every statement with the opcode that carried it, and `bound` with
-    the typed parameters of an execute.
+    the typed parameters of an execute. An execute naming a slot the
+    connection does not hold is refused and noted in `unknown_ids`.
 
     `on(sql, *replies)` scripts the answers to the next executions of `sql`
     and `always(sql, reply)` the answer to every later one; a reply is a
@@ -99,6 +100,7 @@ class Server:
         self.ran_in = []
         self.ops = []
         self.bound = []
+        self.unknown_ids = []
         self.prepared_peak = 0
         self._prepared_open = {}
         self.connections = 0
@@ -242,7 +244,13 @@ class Server:
                     )
             else:
                 if op in (skaidb._OP_EXECUTE, skaidb._OP_EXECUTE_BATCH):
-                    sql = prepared[struct.unpack_from("<I", req, 2)[0]]
+                    slot = struct.unpack_from("<I", req, 2)[0]
+                    if slot not in prepared:  # an id this connection never issued
+                        with self._lock:
+                            self.unknown_ids.append((number, slot))
+                        _send(conn, _f_error(f"unknown prepared statement id {slot}"))
+                        continue
+                    sql = prepared[slot]
                 else:  # one-shot query or stream request: the text itself
                     sql = self._sql(req, 2)
                 with self._lock:
