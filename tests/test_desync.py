@@ -9,17 +9,26 @@ socket it was opened on.
 Against the fake server of `test_transactions`, over real sockets.
 """
 
+import signal
+import struct
+import threading
 import time
 import unittest
+from asyncio import CancelledError
+from unittest import mock
 
 import skaidb
 
 try:
-    from test_stream import _f_chunk, _f_end, _f_header
-    from test_transactions import SCAN, STALL, Server, _Case, _credentials, _rows
+    from test_stream import _f_chunk, _f_end, _f_header, _f_mutation
+    from test_transactions import (
+        CREDIT, SCAN, STALL, Late, Server, _Case, _credentials, _rows,
+    )
 except ImportError:  # run as `python -m unittest tests.test_desync`
-    from tests.test_stream import _f_chunk, _f_end, _f_header
-    from tests.test_transactions import SCAN, STALL, Server, _Case, _credentials, _rows
+    from tests.test_stream import _f_chunk, _f_end, _f_header, _f_mutation
+    from tests.test_transactions import (
+        CREDIT, SCAN, STALL, Late, Server, _Case, _credentials, _rows,
+    )
 
 NAMES = "SELECT name FROM accounts"
 
@@ -53,6 +62,275 @@ def _abandon_impatient(conn):
     next(rows)
     _impatient(conn)
     rows.close()
+
+
+class _Alarm(Exception):
+    """An ordinary exception thrown in from outside the driver, as the
+    handler of a `signal.alarm` deadline does."""
+
+
+class _InterruptedRead:
+    """Stands in for the socket's read file: the read after `after` more
+    raises `exc` instead of reading — what a signal handler that raises
+    does to a blocked `recv`. Whatever the server sent stays unread."""
+
+    def __init__(self, conn, exc, after=0):
+        self._inner, self._exc, self._after = conn._file, exc, after
+        conn._file = self
+
+    def read(self, n):
+        if self._exc is not None:
+            if self._after == 0:
+                exc, self._exc = self._exc, None
+                raise exc
+            self._after -= 1
+        return self._inner.read(n)
+
+    def close(self):
+        self._inner.close()
+
+
+class _InterruptedSend:
+    """Stands in for the socket: the next request gets half way out, then
+    `exc` is raised."""
+
+    def __init__(self, conn, exc):
+        self._inner, self._exc = conn._sock, exc
+        conn._sock = self
+
+    def sendall(self, data):
+        if self._exc is None:
+            return self._inner.sendall(data)
+        exc, self._exc = self._exc, None
+        self._inner.sendall(data[: len(data) // 2])
+        raise exc
+
+    def close(self):
+        self._inner.close()
+
+
+FIRST, SECOND = "SELECT 'first'", "SELECT 'second'"
+BATCH = "INSERT INTO audit (id) VALUES (?)"
+
+
+class Interrupted(unittest.TestCase):
+    """Whatever leaves a round trip between the first byte sent and the last
+    byte read marks the connection broken and closes its socket, and goes on
+    unchanged — a `KeyboardInterrupt`, or anything else a signal handler or
+    a green thread throws into the middle of a statement. Otherwise the
+    unread reply answers the NEXT statement, and every one after it reads
+    the reply of the one before."""
+
+    # Where a statement can be interrupted: what runs first on the
+    # connection, the statement, and how many reads succeed before the
+    # interrupted one (a frame is two reads: its length, then its body).
+    PATHS = [
+        ("a query", None, lambda conn: conn.execute(FIRST), 0),
+        ("a query, between a frame's length and its body", None, lambda conn: conn.execute(FIRST), 1),
+        ("preparing a statement", None, lambda conn: conn.execute(CREDIT, (10, 2)), 0),
+        (
+            "a prepared statement",
+            lambda conn: conn.execute(CREDIT, (10, 1)),
+            lambda conn: conn.execute(CREDIT, (10, 2)),
+            0,
+        ),
+        (
+            "executemany",
+            lambda conn: conn.cursor().executemany(BATCH, [(1,)]),
+            lambda conn: conn.cursor().executemany(BATCH, [(2,), (3,)]),
+            0,
+        ),
+        ("opening a stream", None, lambda conn: conn.stream(SCAN), 0),
+        ("a stream's next frame", None, lambda conn: list(conn.stream(SCAN)), 2),
+        (
+            "a stream's next frame, between its length and its body",
+            None,
+            lambda conn: list(conn.stream(SCAN)),
+            3,
+        ),
+        ("draining an abandoned stream", None, _abandon, 4),
+    ]
+
+    # Not one of them is a transport error, and most are not an `Exception`.
+    INTERRUPTS = [
+        lambda: KeyboardInterrupt(),
+        lambda: SystemExit(1),
+        lambda: CancelledError(),
+        lambda: GeneratorExit(),
+        lambda: _Alarm("deadline"),
+        lambda: MemoryError(),
+    ]
+
+    def server(self):
+        server = Server()
+        self.addCleanup(server.close)
+        server.always(FIRST, _rows(["v"], [("first",)]))
+        server.always(SECOND, _rows(["v"], [("second",)]))
+        server.always(
+            SCAN, [_f_header(["id"]), _f_chunk([(1,)]), _f_chunk([(2,)]), _f_end()]
+        )
+        return server
+
+    def connect(self, server, **kw):
+        conn = skaidb.connect(**dict(_credentials(server), **kw))
+        self.addCleanup(conn.close)
+        return conn
+
+    def interrupted(self, path, exc, wrap=_InterruptedRead, **kw):
+        """A fresh server and a connection on which `path` was interrupted
+        with `exc`."""
+        _, before, act, after = path
+        server = self.server()
+        conn = self.connect(server, **kw)
+        if before is not None:
+            before(conn)
+        if wrap is _InterruptedRead:
+            wrap(conn, exc, after)
+        else:
+            wrap(conn, exc)
+        with self.assertRaises(type(exc)) as cm:
+            act(conn)
+        self.assertIs(cm.exception, exc, "the interrupt itself, unchanged")
+        return server, conn
+
+    def cases(self, paths=None):
+        """Every path interrupted by every kind of exception."""
+        return [
+            (path, make())
+            for path in (self.PATHS if paths is None else paths)
+            for make in self.INTERRUPTS
+        ]
+
+    def test_the_next_statement_reads_its_own_reply(self):
+        for path, exc in self.cases():
+            with self.subTest(path[0], interrupt=type(exc).__name__):
+                server, conn = self.interrupted(path, exc)
+                self.assertEqual(
+                    conn.execute(SECOND).fetchall(),
+                    [("second",)],
+                    "the next statement was handed another statement's reply",
+                )
+                self.assertEqual(conn.execute(FIRST).fetchall(), [("first",)])
+
+    def test_the_connection_is_broken_and_its_socket_closed_at_once(self):
+        for path, exc in self.cases():
+            with self.subTest(path[0], interrupt=type(exc).__name__):
+                server, conn = self.interrupted(path, exc)
+                self.assertFalse(conn.is_usable())
+                self.assertTrue(server.hung_up(1), "the socket is still open")
+                # The usual recovery: the next statement re-dials first.
+                self.assertEqual(server.connections, 1)
+                self.assertEqual(conn.execute(SECOND).fetchall(), [("second",)])
+                self.assertEqual(server.log[-1], (2, SECOND))
+
+    def test_without_automatic_reconnect_the_next_statement_is_refused(self):
+        for path in self.PATHS:
+            with self.subTest(path[0]):
+                server, conn = self.interrupted(path, KeyboardInterrupt(), auto_reconnect=False)
+                with self.assertRaises(skaidb.OperationalError) as cm:
+                    conn.execute(SECOND)
+                self.assertIn("reconnect()", str(cm.exception))
+                self.assertNotIn(SECOND, server.statements, "nothing went out on that socket")
+                conn.reconnect()
+                self.assertEqual(conn.execute(SECOND).fetchall(), [("second",)])
+
+    def test_an_interrupt_while_the_request_is_being_sent(self):
+        # Half a request is on the wire: the next one would be read as the
+        # rest of it.
+        sending = [p for p in self.PATHS if p[0] in ("a query", "opening a stream")]
+        for path, exc in self.cases(sending):
+            with self.subTest(path[0], interrupt=type(exc).__name__):
+                server, conn = self.interrupted(path, exc, wrap=_InterruptedSend)
+                self.assertFalse(conn.is_usable())
+                self.assertTrue(server.hung_up(1), "the socket is still open")
+                self.assertEqual(conn.execute(SECOND).fetchall(), [("second",)])
+                self.assertEqual(server.log, [(2, SECOND)])
+
+    def test_a_stream_header_that_cannot_be_parsed_costs_the_connection(self):
+        # The chunks behind the header are on their way and no stream goes
+        # out to read them.
+        truncated = bytes([skaidb._RESP_ROWS_HEADER]) + struct.pack("<I", 3)
+        server = self.server()
+        server.always(SCAN, [truncated, _f_chunk([(1,)]), _f_end()])
+        conn = self.connect(server)
+        with self.assertRaises(skaidb.InterfaceError):
+            conn.stream(SCAN)
+        self.assertFalse(conn.is_usable())
+        self.assertTrue(server.hung_up(1), "the socket is still open")
+        self.assertEqual(conn.execute(SECOND).fetchall(), [("second",)])
+
+    def test_an_interrupt_while_a_stream_header_is_parsed(self):
+        server = self.server()
+        conn = self.connect(server)
+        stop = KeyboardInterrupt()
+        with mock.patch.object(skaidb._Reader, "text", side_effect=stop):
+            with self.assertRaises(KeyboardInterrupt) as cm:
+                conn.stream(SCAN)
+        self.assertIs(cm.exception, stop)
+        self.assertFalse(conn.is_usable())
+        self.assertTrue(server.hung_up(1), "the socket is still open")
+        self.assertEqual(conn.execute(SECOND).fetchall(), [("second",)])
+
+    def test_an_interrupt_while_a_chunk_is_decoded_ends_the_stream(self):
+        # The frame was read whole and its rows are lost: going on would
+        # skip them without a word.
+        server = self.server()
+        conn = self.connect(server)
+        rows = conn.stream(SCAN)
+        stop = KeyboardInterrupt()
+        with mock.patch.object(skaidb, "_decode_value", side_effect=stop):
+            with self.assertRaises(KeyboardInterrupt) as cm:
+                next(rows)
+        self.assertIs(cm.exception, stop)
+        self.assertEqual(list(rows), [], "the stream is over, not one chunk short")
+        self.assertFalse(conn.is_usable())
+        self.assertTrue(server.hung_up(1), "the socket is still open")
+        rows.close()
+        self.assertEqual(conn.execute(SECOND).fetchall(), [("second",)])
+
+    def test_a_statement_error_still_costs_nothing(self):
+        # The line this must not cross: a server Error is a whole reply.
+        server = self.server()
+        server.on(FIRST, bytes([skaidb._RESP_ERROR]) + struct.pack("<I", 4) + b"nope")
+        server.on(SCAN, bytes([skaidb._RESP_ERROR]) + struct.pack("<I", 4) + b"nope")
+        server.on(SCAN, _f_mutation(3))
+        conn = self.connect(server)
+        for run in (lambda: conn.execute(FIRST), lambda: conn.stream(SCAN)):
+            with self.assertRaises(skaidb.ProgrammingError):
+                run()
+            self.assertTrue(conn.is_usable())
+        self.assertEqual(conn.stream(SCAN).affected, 3)
+        self.assertEqual(conn.execute(SECOND).fetchall(), [("second",)])
+        self.assertEqual(server.connections, 1)
+
+    @unittest.skipUnless(
+        hasattr(signal, "setitimer") and threading.current_thread() is threading.main_thread(),
+        "needs SIGALRM delivered to the thread running the test",
+    )
+    def test_a_signal_handler_that_raises_into_a_blocked_read(self):
+        # The real thing, end to end: the server answers late, the alarm
+        # goes off while the statement waits, and the late reply must not
+        # answer the next statement.
+        server = self.server()
+        server.on(FIRST, Late(_rows(["v"], [("first",)]), 0.5))
+        conn = self.connect(server)
+
+        def on_alarm(signum, frame):
+            raise _Alarm("deadline")
+
+        previous = signal.signal(signal.SIGALRM, on_alarm)
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0.1)
+            with self.assertRaises(_Alarm):
+                conn.execute(FIRST)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+        self.assertEqual(
+            conn.execute(SECOND).fetchall(),
+            [("second",)],
+            "the next statement was handed the late reply",
+        )
 
 
 class BrokenClosesTheSocket(unittest.TestCase):

@@ -857,15 +857,33 @@ class Connection:
         pool can recycle the connection cleanly."""
         self._check_ready()
         started = time.monotonic()
+        with self._lock:
+            # Re-check under the lock: `_stream_open` claims the
+            # connection while holding it, so this is where a statement
+            # racing a stream on another thread is ordered.
+            if self._streaming:
+                raise ProgrammingError(_BUSY_STREAMING)
+            frame = self._exchange(req)
+        if self._observer is not None:
+            self._observer._round_trip(self, time.monotonic() - started)
+        return _Reader(frame)
+
+    def _exchange(self, req: bytes) -> bytes:
+        """Send one request frame and read the first frame of its reply (the
+        caller holds the lock).
+
+        A reply carries no request id: one that is not read to its end is
+        taken for the answer to the next request. So whatever stops this
+        between the first byte sent and the last byte read costs the
+        connection — it is marked broken and its socket closed before the
+        exception goes on. That holds for a transport failure, raised as
+        `OperationalError`, and just as much for anything raised into the
+        middle of it from outside, which propagates unchanged: a
+        `KeyboardInterrupt`, a `SystemExit` or any other exception thrown by
+        a signal handler, a green thread's timeout or cancellation."""
         try:
-            with self._lock:
-                # Re-check under the lock: `_stream_open` claims the
-                # connection while holding it, so this is where a statement
-                # racing a stream on another thread is ordered.
-                if self._streaming:
-                    raise ProgrammingError(_BUSY_STREAMING)
-                self._write_frame(req)
-                frame = self._read_frame()
+            self._write_frame(req)
+            return self._read_frame()
         except OperationalError:
             # A framing-level error (e.g. server closed the socket) leaves the
             # connection unusable; mark it so pools recycle it.
@@ -876,9 +894,9 @@ class Connection:
             self._mark_broken()
             self._observe_failure()
             raise OperationalError(f"query transport failed: {e}") from e
-        if self._observer is not None:
-            self._observer._round_trip(self, time.monotonic() - started)
-        return _Reader(frame)
+        except BaseException:
+            self._mark_broken()
+            raise
 
     def _observe_failure(self) -> None:
         if self._observer is not None and self._connected is not None:
@@ -1061,9 +1079,13 @@ class Connection:
         else:
             req = bytes([_OP_QUERY_STREAM, level]) + struct.pack("<I", len(body)) + body
         r = self._stream_open(req)
-        self._note_statement(sql)
+        # Only a RowsHeader has more frames behind it; until the first frame
+        # turns out to be the whole reply, the rest is still on the socket.
+        whole = False
         try:
+            self._note_statement(sql)
             tag = r.u8()
+            whole = tag in (_RESP_ERROR, _RESP_MUTATION, _RESP_DDL, _RESP_RESULT_SETS)
             if tag == _RESP_ERROR:
                 msg = r.text()
                 if "unknown opcode" in msg:
@@ -1085,16 +1107,21 @@ class Connection:
                 # rest, as `Cursor.nextset()` does.
                 return RowStream(self, [], 0, done=True, sets=self._parse_sets(r))
             if tag != _RESP_ROWS_HEADER:
-                # An unexpected reply leaves us unable to say how many frames
-                # it is made of, so the socket position is unknown.
-                self._mark_broken()
                 raise InterfaceError(f"unexpected response tag {tag} to stream request")
             columns = [r.text() for _ in range(r.u32())]
+            return RowStream(self, columns, 0, done=False)
         except BaseException:
-            # Nothing will consume the stream, so release the claim here.
-            self._stream_release()
+            if whole:
+                # The exchange is over and nothing will consume a stream, so
+                # release the claim here.
+                self._stream_release()
+            else:
+                # No stream goes out to read what follows the header — it
+                # could not be parsed, or the call was interrupted — or the
+                # reply is one this driver does not know, made of nobody
+                # knows how many frames: the socket position is lost.
+                self._mark_broken()
             raise
-        return RowStream(self, columns, 0, done=False)
 
     def _stream_open(self, req: bytes) -> "_Reader":
         """Claim the connection for a stream and send `req`, returning its
@@ -1106,17 +1133,8 @@ class Connection:
                 raise ProgrammingError(_BUSY_STREAMING)
             self._streaming = True
             started = time.monotonic()
-            try:
-                self._write_frame(req)
-                frame = self._read_frame()
-            except OperationalError:
-                self._mark_broken()  # which also ends the claim
-                self._observe_failure()
-                raise
-            except OSError as e:
-                self._mark_broken()
-                self._observe_failure()
-                raise OperationalError(f"query transport failed: {e}") from e
+            # A failure closes the socket, which also ends the claim.
+            frame = self._exchange(req)
         if self._observer is not None:
             self._observer._round_trip(self, time.monotonic() - started)
         return _Reader(frame)
@@ -1418,9 +1436,14 @@ class RowStream:
             conn._mark_broken()
             self._finish()
             raise OperationalError(f"stream transport failed: {e}") from e
-        except InterfaceError:
-            # A frame we could not parse: we no longer know what the peer is
-            # sending, so the connection is not reusable.
+        except BaseException:
+            # A frame we could not parse (`InterfaceError`): we no longer
+            # know what the peer is sending. Or the read, or the decoding of
+            # a chunk, was interrupted from outside (see
+            # `Connection._exchange`): part of a frame is still on the
+            # socket, or a chunk's rows were dropped. Either way the
+            # connection is not reusable and the stream is over — going on
+            # would read from the middle of a frame, or skip rows silently.
             conn._mark_broken()
             self._finish()
             raise
@@ -1474,6 +1497,13 @@ class RowStream:
                     conn._mark_broken()
             except (OperationalError, OSError):
                 conn._mark_broken()
+            except BaseException:
+                # Interrupted in the middle of the drain: the socket is not
+                # at a request boundary, and a second close() must not
+                # pick the drain up from the middle of a frame.
+                conn._mark_broken()
+                self._finish()
+                raise
         self._finish()
 
     def __enter__(self) -> "RowStream":

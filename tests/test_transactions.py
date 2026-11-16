@@ -45,6 +45,14 @@ DROP = object()
 STALL = object()
 
 
+class Late:
+    """Scripted in place of a reply: `reply`, sent `delay` seconds late."""
+
+    def __init__(self, reply, delay):
+        self.reply = reply
+        self.delay = delay
+
+
 def _rows(columns, rows) -> bytes:
     """A Rows frame: the columns, then the rows (as a stream's header and
     chunk lay them out)."""
@@ -66,7 +74,8 @@ class Server:
 
     `on(sql, *replies)` scripts the answers to the next executions of `sql`
     and `always(sql, reply)` the answer to every later one; a reply is a
-    payload, a list of payloads (the frames of a stream), `DROP` or `STALL`.
+    payload, a list of payloads (the frames of a stream), `DROP`, `STALL` or
+    a `Late` one of those.
     Unscripted, `BEGIN …` / `COMMIT` / `ROLLBACK` are acknowledged, a
     `SELECT` answers one row and anything else is a one-row mutation."""
 
@@ -191,6 +200,9 @@ class Server:
                 reply = self._scripted(sql)
                 if reply is None:
                     reply = self._default(sql)
+            if isinstance(reply, Late):
+                time.sleep(reply.delay)
+                reply = reply.reply
             if reply is DROP:
                 return
             if reply is STALL:
@@ -572,6 +584,32 @@ class OneConnection(_Case):
         # Outside the transaction the connection reconnects as it always did.
         self.assertEqual(self.conn.execute("SELECT 1").fetchall(), [(1,)])
         self.assertEqual(self.server.connections, 2)
+
+    def test_an_interrupt_inside_a_body_statement_costs_the_connection(self):
+        # The reply to DEBIT is still on the socket: a ROLLBACK sent there
+        # would read it as its own answer. Closing the socket is what rolls
+        # the transaction back.
+        stop = KeyboardInterrupt()
+        real = self.conn._file
+
+        class Interrupted:
+            def read(self, n):
+                self.read = real.read
+                raise stop
+
+            close = real.close
+
+        def body(conn):
+            conn._file = Interrupted()
+            conn.execute(DEBIT)
+
+        with self.assertRaises(KeyboardInterrupt) as cm:
+            self.conn.transaction(body)
+        self.assertIs(cm.exception, stop)
+        self.assertTrue(self.server.hung_up(1), "the socket is still open")
+        self.assertNotIn("ROLLBACK", self.server.statements, "nothing more on that socket")
+        self.assertEqual(self.conn.execute("SELECT 1").fetchall(), [(1,)])
+        self.assertEqual(self.server.log[-1], (2, "SELECT 1"))
 
     def test_a_stream_the_body_leaves_open_costs_the_connection(self):
         # Neither COMMIT nor ROLLBACK can be sent while a stream owns the
