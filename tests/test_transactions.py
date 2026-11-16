@@ -14,6 +14,7 @@ import hmac
 import socket
 import struct
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -40,6 +41,8 @@ SCAN = "SELECT id FROM accounts"
 _DDL = bytes([skaidb._RESP_DDL])
 # Scripted in place of a reply: close the connection without answering.
 DROP = object()
+# Scripted in place of a reply: do not answer, and keep the connection open.
+STALL = object()
 
 
 def _rows(columns, rows) -> bytes:
@@ -58,17 +61,19 @@ class Server:
     `statements` is every statement received, in order — the text of a
     one-shot or stream request, or the text behind the prepared id of an
     execute; `log` pairs each with the number of the connection it arrived
-    on, and `connections` counts the connections accepted.
+    on, `connections` counts the connections accepted and `hung_up(n)`
+    tells whether the client has closed connection `n`.
 
     `on(sql, *replies)` scripts the answers to the next executions of `sql`
     and `always(sql, reply)` the answer to every later one; a reply is a
-    payload, a list of payloads (the frames of a stream) or `DROP`.
+    payload, a list of payloads (the frames of a stream), `DROP` or `STALL`.
     Unscripted, `BEGIN …` / `COMMIT` / `ROLLBACK` are acknowledged, a
     `SELECT` answers one row and anything else is a one-row mutation."""
 
     def __init__(self):
         self.log = []
         self.connections = 0
+        self._hung_up = set()
         self._script = {}
         self._always = {}
         self._lock = threading.Lock()
@@ -95,6 +100,19 @@ class Server:
         with self._lock:
             return [sql for _, sql in self.log]
 
+    def hung_up(self, number, within=2.0) -> bool:
+        """Whether the client has closed connection `number`. Waits up to
+        `within` seconds for this server's thread to see it, so a socket the
+        client closed at once reads True, and one it still holds False."""
+        deadline = time.monotonic() + within
+        while True:
+            with self._lock:
+                if number in self._hung_up:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.005)
+
     def close(self):
         self.closed = True
         self.sock.close()
@@ -115,8 +133,9 @@ class Server:
             with conn:
                 if self._handshake(conn):
                     self._serve(conn, number)
-        except OSError:
-            pass
+        except OSError:  # reset: the client closed with a reply still unread
+            with self._lock:
+                self._hung_up.add(number)
 
     @staticmethod
     def _handshake(conn) -> bool:
@@ -146,7 +165,9 @@ class Server:
         prepared = []  # this connection's prepared statements; the id is the index
         while True:
             req = _read_frame(conn)
-            if req is None:
+            if req is None:  # the client closed the connection
+                with self._lock:
+                    self._hung_up.add(number)
                 return
             op = req[0]
             if op in (skaidb._OP_CLOSE, skaidb._OP_HELLO):
@@ -172,6 +193,8 @@ class Server:
                     reply = self._default(sql)
             if reply is DROP:
                 return
+            if reply is STALL:
+                continue
             for payload in reply if isinstance(reply, list) else [reply]:
                 _send(conn, payload)
 
@@ -529,6 +552,27 @@ class OneConnection(_Case):
         self.assertEqual(self.server.statements, ["BEGIN", DEBIT, "COMMIT"])
         self.assertEqual(self.server.connections, 1)
 
+    def test_a_read_timeout_in_the_body_ends_the_session_at_once(self):
+        # The server is alive and still holds the session with its open
+        # transaction: only the socket closing ends it there. The helper
+        # cannot send a ROLLBACK (the reply to DEBIT may still arrive), and
+        # must not leave the socket open until the connection is next used.
+        self.server.on(DEBIT, STALL)
+
+        def body(conn):
+            conn._sock.settimeout(0.3)  # the read timeout, for this statement
+            conn.execute(DEBIT)
+
+        with self.assertRaises(skaidb.OperationalError) as cm:
+            self.conn.transaction(body)
+        self.assertIn("timed out", str(cm.exception))
+        self.assertEqual(self.server.statements, ["BEGIN", DEBIT])
+        self.assertTrue(self.server.hung_up(1), "the socket is still open")
+        self.assertEqual(self.server.connections, 1, "and nothing was re-dialed")
+        # Outside the transaction the connection reconnects as it always did.
+        self.assertEqual(self.conn.execute("SELECT 1").fetchall(), [(1,)])
+        self.assertEqual(self.server.connections, 2)
+
     def test_a_stream_the_body_leaves_open_costs_the_connection(self):
         # Neither COMMIT nor ROLLBACK can be sent while a stream owns the
         # connection, so the transaction stays open on that socket: it must
@@ -556,6 +600,9 @@ class OneConnection(_Case):
                 else:
                     self.assertIn("busy streaming", str(cm.exception))
                 self.assertEqual(self.server.statements, ["BEGIN", SCAN])
+                # Closing the socket is what ends the transaction on the
+                # server: at once, not when the connection is next used.
+                self.assertTrue(self.server.hung_up(self.server.connections))
                 held.pop().close()
                 self.assertFalse(self.conn.is_usable(), "still inside an open transaction")
                 # The next statement runs on a fresh connection.

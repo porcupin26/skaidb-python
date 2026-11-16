@@ -16,12 +16,114 @@ import skaidb
 
 try:
     from test_stream import _f_chunk, _f_end, _f_header
-    from test_transactions import SCAN, _Case, _rows
+    from test_transactions import SCAN, STALL, Server, _Case, _credentials, _rows
 except ImportError:  # run as `python -m unittest tests.test_desync`
     from tests.test_stream import _f_chunk, _f_end, _f_header
-    from tests.test_transactions import SCAN, _Case, _rows
+    from tests.test_transactions import SCAN, STALL, Server, _Case, _credentials, _rows
 
 NAMES = "SELECT name FROM accounts"
+
+_HEADER = _f_header(["id"])
+_CHUNK = _f_chunk([(1,)])
+_UNKNOWN = bytes([99])  # no such response tag
+# A result with more frames still to come than an abandoned stream drains.
+_TOO_LONG = (
+    [_HEADER]
+    + [_f_chunk([(i,)]) for i in range(skaidb._STREAM_DRAIN_MAX_FRAMES + 5)]
+    + [_f_end()]
+)
+
+
+def _abandon(conn):
+    """Open a stream, read one row, close it with the rest unread."""
+    rows = conn.stream(SCAN)
+    next(rows)
+    rows.close()
+
+
+def _impatient(conn):
+    """Shorten the read timeout from here on (the dial and the handshake
+    ran under the usual one), for a reply that is not coming."""
+    conn._sock.settimeout(0.3)
+    return conn
+
+
+def _abandon_impatient(conn):
+    rows = conn.stream(SCAN)
+    next(rows)
+    _impatient(conn)
+    rows.close()
+
+
+class BrokenClosesTheSocket(unittest.TestCase):
+    """A connection marked broken closes its socket at once — not at the
+    next statement and not at `close()`. Until the socket closes the server
+    keeps the session, a transaction open in it and the rest of a stream it
+    is still sending."""
+
+    # What the server answers the statement with, what the client does, and
+    # what that raises (None: nothing — close() reports through is_usable()).
+    CASES = [
+        (
+            "a read timeout",
+            STALL,
+            lambda conn: _impatient(conn).execute(SCAN),
+            skaidb.OperationalError,
+        ),
+        (
+            "a read timeout opening a stream",
+            STALL,
+            lambda conn: _impatient(conn).stream(SCAN),
+            skaidb.OperationalError,
+        ),
+        (
+            "a read timeout mid-stream",
+            [_HEADER, _CHUNK],
+            lambda conn: list(_impatient(conn).stream(SCAN)),
+            skaidb.OperationalError,
+        ),
+        (
+            "an unknown frame mid-stream",
+            [_HEADER, _UNKNOWN],
+            lambda conn: list(conn.stream(SCAN)),
+            skaidb.InterfaceError,
+        ),
+        (
+            "an unknown reply to a stream request",
+            _UNKNOWN,
+            lambda conn: conn.stream(SCAN),
+            skaidb.InterfaceError,
+        ),
+        ("an abandoned stream too long to drain", _TOO_LONG, _abandon, None),
+        ("an unknown frame while draining", [_HEADER, _CHUNK, _UNKNOWN], _abandon, None),
+        ("a read timeout while draining", [_HEADER, _CHUNK], _abandon_impatient, None),
+    ]
+
+    def test_the_server_sees_the_client_hang_up_without_another_call(self):
+        for name, reply, act, raises in self.CASES:
+            with self.subTest(name):
+                server = Server()
+                self.addCleanup(server.close)
+                server.always(SCAN, reply)
+                # No automatic reconnect: a re-dial would close the old
+                # socket on its way and hide what is under test.
+                conn = skaidb.connect(**dict(_credentials(server), auto_reconnect=False))
+                self.addCleanup(conn.close)
+                if raises is None:
+                    act(conn)
+                else:
+                    with self.assertRaises(raises):
+                        act(conn)
+                self.assertFalse(conn.is_usable())
+                self.assertTrue(server.hung_up(1), "the socket is still open")
+                # The connection refuses work until it is re-dialed …
+                with self.assertRaises(skaidb.OperationalError) as cm:
+                    conn.execute("SELECT 1")
+                self.assertIn("reconnect()", str(cm.exception))
+                self.assertEqual(server.connections, 1)
+                # … and then carries statements again.
+                conn.reconnect()
+                self.assertEqual(conn.execute("SELECT 1").fetchall(), [(1,)])
 
 
 class StaleStream(_Case):

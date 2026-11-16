@@ -556,8 +556,9 @@ class Connection:
         self._lock = threading.Lock()
         self.closed = False
         # Set once a transport error, or an abandoned stream too long to
-        # drain, leaves the socket out of sync; a pool checks `is_usable()`
-        # and discards the connection instead of reusing it.
+        # drain, leaves the socket out of sync — the socket is closed with it
+        # (`_mark_broken`); a pool checks `is_usable()` and discards the
+        # connection instead of reusing it.
         self._broken = False
         # True while a `RowStream` owns the socket. The stream spans many
         # frames and many `next()` calls, so holding `_lock` for its duration
@@ -640,6 +641,16 @@ class Connection:
         # `RowStream` sees the socket gone (`RowStream._stale`) and neither
         # reads nor releases anything from here on.
         self._streaming = False
+
+    def _mark_broken(self) -> None:
+        """The socket is dead or out of step with the server: mark the
+        connection broken and close the socket now, not at the next
+        statement or at `close()`. That ends the session on the server —
+        and with it a transaction open there, and the rows it holds — and
+        leaves no unread frame for a later statement to take for its own
+        reply."""
+        self._broken = True
+        self._drop_socket()
 
     def _send_hello(self) -> None:
         """Best-effort self-identification (fills the server's ``drivers``
@@ -858,11 +869,11 @@ class Connection:
         except OperationalError:
             # A framing-level error (e.g. server closed the socket) leaves the
             # connection unusable; mark it so pools recycle it.
-            self._broken = True
+            self._mark_broken()
             self._observe_failure()
             raise
         except OSError as e:  # mid-query socket error: dead peer, timeout, ...
-            self._broken = True
+            self._mark_broken()
             self._observe_failure()
             raise OperationalError(f"query transport failed: {e}") from e
         if self._observer is not None:
@@ -882,8 +893,9 @@ class Connection:
     def _check_ready(self) -> None:
         """Refuse to start a request on a connection that cannot carry one.
         A broken connection is refused rather than retried because its socket
-        may hold unread frames: writing into it would read someone else's
-        answer back, which is far more confusing than an error here."""
+        was out of step with the server (and is closed, see `_mark_broken`):
+        a request written into it would have read someone else's answer
+        back, which is far more confusing than an error here."""
         if self.closed:
             raise ProgrammingError("connection is closed")
         if (
@@ -1075,7 +1087,7 @@ class Connection:
             if tag != _RESP_ROWS_HEADER:
                 # An unexpected reply leaves us unable to say how many frames
                 # it is made of, so the socket position is unknown.
-                self._broken = True
+                self._mark_broken()
                 raise InterfaceError(f"unexpected response tag {tag} to stream request")
             columns = [r.text() for _ in range(r.u32())]
         except BaseException:
@@ -1098,13 +1110,11 @@ class Connection:
                 self._write_frame(req)
                 frame = self._read_frame()
             except OperationalError:
-                self._streaming = False
-                self._broken = True
+                self._mark_broken()  # which also ends the claim
                 self._observe_failure()
                 raise
             except OSError as e:
-                self._streaming = False
-                self._broken = True
+                self._mark_broken()
                 self._observe_failure()
                 raise OperationalError(f"query transport failed: {e}") from e
         if self._observer is not None:
@@ -1268,8 +1278,9 @@ class Connection:
                 if self._streaming:
                     # A RowStream the body left open kept COMMIT / ROLLBACK
                     # from being sent, so the transaction is still open on
-                    # this socket: it must not carry another statement.
-                    self._broken = True
+                    # this socket: it must not carry another statement, and
+                    # closing it is what ends the transaction on the server.
+                    self._mark_broken()
 
     def commit(self) -> None:  # no-op: skaidb auto-commits each statement
         pass
@@ -1400,17 +1411,17 @@ class RowStream:
         except OperationalError:
             # Dead socket mid-stream: there is nothing left to drain and the
             # connection cannot carry another statement.
-            conn._broken = True
+            conn._mark_broken()
             self._finish()
             raise
         except OSError as e:
-            conn._broken = True
+            conn._mark_broken()
             self._finish()
             raise OperationalError(f"stream transport failed: {e}") from e
         except InterfaceError:
             # A frame we could not parse: we no longer know what the peer is
             # sending, so the connection is not reusable.
-            conn._broken = True
+            conn._mark_broken()
             self._finish()
             raise
         if t == _RESP_ROWS_END:
@@ -1422,7 +1433,7 @@ class RowStream:
             # request boundary and the connection stays usable.
             self._finish()
             raise _server_error(fr.text())
-        conn._broken = True
+        conn._mark_broken()
         self._finish()
         raise InterfaceError(f"unexpected frame tag {t} in stream")
 
@@ -1457,12 +1468,12 @@ class RowStream:
                     if tag in (_RESP_ROWS_END, _RESP_ERROR):
                         break
                     if tag != _RESP_ROWS_CHUNK:
-                        conn._broken = True
+                        conn._mark_broken()
                         break
                 else:
-                    conn._broken = True
+                    conn._mark_broken()
             except (OperationalError, OSError):
-                conn._broken = True
+                conn._mark_broken()
         self._finish()
 
     def __enter__(self) -> "RowStream":
