@@ -37,6 +37,9 @@ The driver enforces it like this:
 3. Stopping early — `break`, an exception, leaving the `with` block, or just
    dropping the object — calls `close()`, which **drains** the frames the
    server has already sent so the socket is back at a request boundary.
+   (Dropping the object closes it when the interpreter collects it: at once
+   on CPython, some time later on PyPy — where the connection stays busy
+   until then. Use `with`, or call `close()`.)
 4. The drain is capped at **64 frames**. If the stream still has more than
    that queued, the driver stops reading and **marks the connection broken**,
    closing its socket (which also tells the server to stop sending):

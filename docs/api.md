@@ -433,7 +433,9 @@ with conn.stream(sql) as rows: ...  # close() on exit
   [broken](#broken-connections); so does anything else that interrupts the
   read or the decoding of a chunk. The stream is over in each case.
 - `close()` is idempotent and is also called by `__del__`, so a stream that
-  is simply dropped still follows the drain rule (errors there are swallowed).
+  is simply dropped still follows the drain rule (errors there are swallowed)
+  — when it is collected, which on PyPy is not the moment the last reference
+  goes.
 - A stream belongs to the socket it was opened on. Once the connection has
   closed that socket or re-dialed, iterating past the rows already received
   raises `OperationalError`, and `close()` reads nothing: what is on the
