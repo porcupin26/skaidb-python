@@ -553,6 +553,47 @@ class OneConnection(_Case):
         self.assertEqual(self.server.statements, ["BEGIN", DEBIT], "no COMMIT on a fresh connection")
         self.assertEqual(self.server.connections, 1)
 
+    def test_the_body_cannot_redial_its_way_out_of_the_transaction(self):
+        # A body that answers the loss with reconnect() would run the rest
+        # of its statements on a session with no transaction — each one
+        # committing on its own — and the helper's COMMIT would go there
+        # too. reconnect() is refused until the transaction has ended.
+        self.server.on(DEBIT, DROP)
+        refused = []
+
+        def body(conn):
+            try:
+                conn.execute(DEBIT)
+            except skaidb.OperationalError:
+                try:
+                    conn.reconnect()
+                except skaidb.ProgrammingError as e:
+                    refused.append(str(e))
+                    raise
+                conn.execute(DEBIT)
+
+        with self.assertRaises(skaidb.ProgrammingError):
+            self.conn.transaction(body)
+        self.assertEqual(len(refused), 1)
+        self.assertIn("transaction()", refused[0])
+        self.assertEqual(self.server.log, [(1, "BEGIN"), (1, DEBIT)])
+        self.assertEqual(self.server.connections, 1, "nothing was dialed")
+        # Once the helper has returned, reconnect() works as it always did.
+        self.conn.reconnect()
+        self.assertEqual(self.conn.execute("SELECT 1").fetchall(), [(1,)])
+        self.assertEqual(self.server.log[-1], (2, "SELECT 1"))
+
+    def test_reconnect_is_refused_on_a_healthy_connection_inside_the_transaction_too(self):
+        def body(conn):
+            conn.execute(DEBIT)
+            conn.reconnect()
+
+        with self.assertRaises(skaidb.ProgrammingError):
+            self.conn.transaction(body)
+        # The transaction is still on its socket, so it is rolled back there.
+        self.assertEqual(self.server.log, [(1, "BEGIN"), (1, DEBIT), (1, "ROLLBACK")])
+        self.assert_usable()
+
     def test_a_connection_lost_at_commit_is_not_retried(self):
         self.server.on("COMMIT", DROP)
         runs = []

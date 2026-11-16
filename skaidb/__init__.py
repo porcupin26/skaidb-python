@@ -689,9 +689,22 @@ class Connection:
     def reconnect(self) -> None:
         """Re-dial (failing over across endpoints) and re-authenticate,
         discarding any per-connection prepared statements. A pool calls this to
-        recover a broken connection."""
+        recover a broken connection.
+
+        Refused with ``ProgrammingError`` while :meth:`transaction` has its
+        transaction open: the transaction lives on the socket it began on,
+        so after a re-dial the rest of the body would commit statement by
+        statement and the ``COMMIT`` would reach a session with nothing to
+        commit."""
         if self.closed:
             raise ProgrammingError("connection is closed")
+        if self._txn_open:
+            raise ProgrammingError(
+                "reconnect() inside transaction(): the transaction is on the "
+                "connection it began on, and on a new one the statements "
+                "that follow would each commit on their own; let the error "
+                "end the transaction and run it again"
+            )
         # Try every OTHER endpoint before the one that just failed: a member
         # going down during a rolling restart still accepts a connect for a
         # moment, and re-dialing it first lost the retry (and an 8-hour
@@ -1274,10 +1287,12 @@ class Connection:
         ``OperationalError`` and nothing is retried, by the automatic
         reconnect either: the transaction was on the connection that failed.
         (``begin`` itself re-dials like any statement — nothing is open
-        yet.) Finish or close any :class:`RowStream` the body opens before
-        it returns: while one is open neither ``COMMIT`` nor ``ROLLBACK``
-        can be sent, and the connection is marked broken rather than left
-        inside an open transaction.
+        yet.) For the same reason the body cannot call :meth:`reconnect`
+        (``ProgrammingError``): let the failure end the transaction and run
+        it again. Finish or close any :class:`RowStream` the body opens
+        before it returns: while one is open neither ``COMMIT`` nor
+        ``ROLLBACK`` can be sent, and the connection is marked broken
+        rather than left inside an open transaction.
         """
         if attempts < 1:
             raise ValueError("attempts must be >= 1")
