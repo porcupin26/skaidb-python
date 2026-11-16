@@ -476,6 +476,41 @@ def _strip_strings(sql: str) -> str:
     return "".join(out)
 
 
+# ---- The session database ---------------------------------------------------
+
+
+def _used_database(sql: str) -> "str | None":
+    """The database a ``USE [DATABASE] <name>`` statement names, when `sql`
+    is exactly one such statement (a trailing ``;`` allowed): the name as
+    written, or with its double quotes removed and the doubled quotes inside
+    undone. None for anything else — every driver reads a ``USE`` by these
+    rules (PROTOCOL.md §6 rule 9)."""
+    rest = _strip_keyword(sql.strip().rstrip(";").rstrip(), "USE")
+    if rest is None:
+        return None
+    named = _strip_keyword(rest, "DATABASE")
+    if named is not None:
+        rest = named
+    if rest.startswith('"'):
+        inner = rest[1:-1]
+        # A lone quote inside would end the name early: not one name.
+        if len(rest) < 2 or not rest.endswith('"') or not inner or '"' in inner.replace('""', ""):
+            return None
+        return inner.replace('""', '"')
+    if rest and all(ch.isalnum() or ch == "_" for ch in rest):
+        return rest
+    return None
+
+
+def _strip_keyword(text: str, word: str) -> "str | None":
+    """`text` after the leading keyword `word` (any case) and the whitespace
+    that must follow it; None when it does not start with one."""
+    head, tail = text[: len(word)], text[len(word) :]
+    if head.isascii() and head.upper() == word and tail[:1].isspace():
+        return tail.lstrip()
+    return None
+
+
 # ---- SCRAM-SHA-256 handshake (§2) -----------------------------------------
 
 
@@ -519,6 +554,7 @@ class Connection:
     _auto_reconnect = False
     _cert_auth = False
     _connected = None
+    _database = None
     # The pool that owns this connection (see `ConnectionPool`): told each
     # round trip's latency, each transport failure and each write, and asked
     # for the dial order when the connection re-dials. None outside a pool.
@@ -577,6 +613,10 @@ class Connection:
         self._password = password
         self._connect_timeout = connect_timeout
         self._read_timeout = read_timeout
+        # The database the session is in, as far as the driver knows: the
+        # one asked for here, then the one named by the last `USE` the
+        # server answered with success (`_note_database`). Every dial enters
+        # it before anything else is sent — a new session starts in none.
         self._database = database
         self._tls_ctx = tls_ctx
         self._tls_server_name = tls_server_name
@@ -683,8 +723,10 @@ class Connection:
             pass
 
     def _use_database(self, db: str) -> None:
+        """Enter `db`, and remember it as the session's database."""
         ident = '"' + db.replace('"', '""') + '"'
         self._query("USE " + ident, self._consistency)
+        self._database = db
 
     def reconnect(self) -> None:
         """Re-dial (failing over across endpoints) and re-authenticate,
@@ -935,6 +977,17 @@ class Connection:
         if self._observer is not None and _is_write(sql):
             self._observer._wrote(self)
 
+    def _note_database(self, sql: str) -> None:
+        """A statement succeeded: if it was a ``USE``, its database is the
+        session's from now on, and the one every later dial of this
+        connection enters (`_open`). Sent as an ordinary statement it used
+        to be the server's knowledge alone: after a re-dial the session was
+        in no database, and the next statement ran against whatever table of
+        that name the default database holds."""
+        database = _used_database(sql)
+        if database is not None:
+            self._database = database
+
     def _check_ready(self) -> None:
         """Refuse to start a request on a connection that cannot carry one.
         A broken connection is refused rather than retried because its socket
@@ -1125,6 +1178,8 @@ class Connection:
                     what = "parameterised streaming (skaidb >= 0.330)" if params else "streaming"
                     raise ProgrammingError(f"server does not support {what}: {msg}")
                 raise _server_error(msg)
+            if tag in (_RESP_MUTATION, _RESP_DDL):
+                self._note_database(sql)  # a USE, answered with success
             if tag == _RESP_MUTATION:
                 # Not a row-producing statement: one ordinary frame is the
                 # whole reply, so the stream is empty and already finished.
@@ -1598,6 +1653,7 @@ class Cursor:
             text = _bind(sql, None)
             kind, a, b = conn._run(lambda: conn._query(text, self._consistency))
         conn._note_statement(sql)
+        conn._note_database(sql)
         self._result_sets = []
         if kind == "sets":
             self._result_sets = list(a)
@@ -2094,6 +2150,8 @@ class ConnectionPool:
             elif not conn.is_usable():
                 conn.close()  # discard a stale idle connection, then loop
                 continue
+            elif not self._in_pool_database(conn):
+                continue
             with self._lock:
                 m = self._members.get(conn._pool_ep)
                 if m is not None:
@@ -2101,6 +2159,23 @@ class ConnectionPool:
             conn._pool_affinity = affinity
             conn._pool_out = True
             return conn
+
+    def _in_pool_database(self, conn: Connection) -> bool:
+        """Put an idle connection back in the pool's database when its last
+        borrower left it in another one with a ``USE`` — one round trip,
+        only then. False, with the connection closed, when that fails: it
+        must not go out in a database the next borrower did not ask for. A
+        pool made without ``database=`` has none to restore, and its
+        connections stay where a borrower took them."""
+        database = self._kwargs.get("database")
+        if database is None or conn._database == database:
+            return True
+        try:
+            conn._use_database(database)
+        except Error:
+            conn.close()
+            return False
+        return True
 
     def putconn(self, conn: Connection) -> None:
         """Return a connection to the pool, or close it if it is broken, its

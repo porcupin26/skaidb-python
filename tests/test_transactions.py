@@ -11,6 +11,7 @@ helper retries on exactly that prefix.
 
 import hashlib
 import hmac
+import re
 import socket
 import struct
 import threading
@@ -70,18 +71,24 @@ class Server:
     one-shot or stream request, or the text behind the prepared id of an
     execute; `log` pairs each with the number of the connection it arrived
     on, `connections` counts the connections accepted and `hung_up(n)`
-    tells whether the client has closed connection `n`.
+    tells whether the client has closed connection `n`. `ran_in` pairs each
+    statement with the database its session was in — the one the last `USE`
+    answered with success named, None on a session that entered none.
+    `restart()` closes every open connection, as a restarting server does.
 
     `on(sql, *replies)` scripts the answers to the next executions of `sql`
     and `always(sql, reply)` the answer to every later one; a reply is a
     payload, a list of payloads (the frames of a stream), `DROP`, `STALL` or
     a `Late` one of those.
-    Unscripted, `BEGIN …` / `COMMIT` / `ROLLBACK` are acknowledged, a
-    `SELECT` answers one row and anything else is a one-row mutation."""
+    Unscripted, `BEGIN …` / `COMMIT` / `ROLLBACK` / `USE …` are
+    acknowledged, a `SELECT` answers one row and anything else is a one-row
+    mutation."""
 
     def __init__(self):
         self.log = []
+        self.ran_in = []
         self.connections = 0
+        self._open = []
         self._hung_up = set()
         self._script = {}
         self._always = {}
@@ -122,6 +129,16 @@ class Server:
                 return False
             time.sleep(0.005)
 
+    def restart(self):
+        """Close every connection accepted so far; the listener stays."""
+        with self._lock:
+            gone, self._open = self._open, []
+        for conn in gone:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
     def close(self):
         self.closed = True
         self.sock.close()
@@ -135,6 +152,7 @@ class Server:
             with self._lock:
                 self.connections += 1
                 number = self.connections
+                self._open.append(conn)
             threading.Thread(target=self._serve_safe, args=(conn, number), daemon=True).start()
 
     def _serve_safe(self, conn, number):
@@ -175,6 +193,7 @@ class Server:
 
     def _serve(self, conn, number):
         prepared = []  # this connection's prepared statements; the id is the index
+        database = None  # the session's database
         while True:
             req = _read_frame(conn)
             if req is None:  # the client closed the connection
@@ -200,9 +219,13 @@ class Server:
                     sql = self._sql(req, 2)
                 with self._lock:
                     self.log.append((number, sql))
+                    self.ran_in.append((database, sql))
                 reply = self._scripted(sql)
                 if reply is None:
                     reply = self._default(sql)
+                use = _USE.match(sql)
+                if use and reply == _DDL:
+                    database = use.group(1).replace('""', '"') if use.group(1) is not None else use.group(2)
             if isinstance(reply, Late):
                 time.sleep(reply.delay)
                 reply = reply.reply
@@ -227,11 +250,18 @@ class Server:
 
     @staticmethod
     def _default(sql):
-        if sql.split()[0] in ("BEGIN", "COMMIT", "ROLLBACK"):
+        if sql.split()[0].upper() in ("BEGIN", "COMMIT", "ROLLBACK", "USE"):
             return _DDL
         if sql.startswith("SELECT"):
             return _rows(["n"], [(1,)])
         return _f_mutation(1)
+
+
+# What this server reads as `USE [DATABASE] <name>`: the name in double
+# quotes (group 1, `""` for a quote inside) or bare (group 2).
+_USE = re.compile(
+    r'\s*USE\s+(?:DATABASE\s+)?(?:"((?:[^"]|"")+)"|(\w+))\s*;?\s*\Z', re.IGNORECASE
+)
 
 
 def _credentials(server):
