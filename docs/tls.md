@@ -54,9 +54,10 @@ pool = skaidb.pool(seeds=["db1", "db2", "db3"], tls_ca="/etc/skaidb/ca.crt",
 ## Client certificates
 
 `tls_client_cert` / `tls_client_key` (PEM files) make the driver present a
-client certificate in the TLS handshake, which a server with
-`client_tls = "required"` and client verification needs. On its own the
-certificate only opens the TLS session; the login is still the SCRAM user.
+client certificate in the TLS handshake. A server with the certificate login
+enabled (`auth.x509_enabled`) asks for one and checks it against its client
+CA; any other server ignores it. On its own the certificate only opens the
+TLS session; the login is still the SCRAM user.
 
 With `auth_mechanism="certificate"` the certificate IS the login (wire
 mechanism EXTERNAL): the server maps its Common Name to a role and no
@@ -77,12 +78,23 @@ together (`ProgrammingError` when only one is given), and
 
 ## Failure modes
 
+All connect-time failures are reported per endpoint in one
+`OperationalError` after every seed was tried:
+`could not connect to any endpoint (host:port: <symptom>; …)`. The symptoms
+below are what a server answers each mistake with; the text in brackets is
+OpenSSL's, and varies a little with the Python build.
+
 | Symptom | Cause |
 |---------|-------|
-| `OperationalError: could not connect to any endpoint (…: [SSL: CERTIFICATE_VERIFY_FAILED] …)` | the CA does not sign the server certificate, or `tls_server_name` does not match a SAN |
-| `OperationalError: could not connect to any endpoint (…: [SSL: WRONG_VERSION_NUMBER] …)` | the server port is plaintext (TLS not enabled on the listener) |
-| `OperationalError: … connection closed by server` right after connect, without TLS | the server requires TLS (`client_tls = required`) and you dialed plaintext |
-| `OperationalError: bad handshake challenge` | usually a plaintext dial to a TLS-only port, or the wrong port (7080 is the REST gateway) |
-
-All connect-time failures are reported per endpoint in one
-`OperationalError` after every seed was tried.
+| `[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate` | the CA you trust — `tls_ca`, or the system store under `tls=True` — did not sign the server certificate. A cluster's own CA is not in the system store: pass `tls_ca` |
+| `[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for '<name>'.` | `tls_server_name` is not a subject alternative name of the server certificate |
+| `[SSL: UNEXPECTED_EOF_WHILE_READING] EOF occurred in violation of protocol` (Python 3.8 and 3.9: `TLS/SSL connection has been closed (EOF)`) | TLS dialed to a plaintext port: the server has `client_tls = "off"` and hangs up on the TLS hello |
+| `Connection reset by peer` | plaintext dialed to a server with `client_tls = "required"`: it refuses the connection before any handshake frame |
+| `timed out`, once the read timeout has passed | plaintext dialed to the REST gateway's port (7080), which waits for an HTTP request |
+| `[SSL: WRONG_VERSION_NUMBER] wrong version number`, or `record layer failure` | TLS dialed to a plaintext REST port, which answers in plain HTTP |
+| `The read operation timed out` | TLS dialed to the HTTPS REST port (7443): the TLS handshake succeeds, and the protocol behind it is HTTP |
+| `[SSL: TLSV1_ALERT_UNKNOWN_CA] tlsv1 alert unknown ca` | the server's client CA (`auth.x509_ca_file`) did not sign the client certificate |
+| `authentication denied: certificate authentication needs TLS, auth.x509_enabled, and a client certificate that chains to auth.x509_ca_file and carries a Common Name` | `auth_mechanism="certificate"` with no client certificate given, or against a server without the certificate login |
+| `authentication denied: no user matches the client certificate's Common Name` | the certificate is accepted, and the server has no user of that name |
+| `authentication denied: the username does not match the client certificate's Common Name` | `user` asserts another name than the certificate's |
+| `certificate authentication needs TLS with a client certificate` | `auth_mechanism="certificate"` with no TLS option given at all |
