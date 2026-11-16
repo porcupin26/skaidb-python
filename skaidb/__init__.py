@@ -705,11 +705,12 @@ class Connection:
     _database = None
     _session_consistency = None
     _session_scan_budget = None
-    # The part of the session's state the statement being run sets itself
-    # (`_stating`), and whether a dial made for it left that part out
-    # (`_restore_session`).
-    _stating = None
-    _unrestored = False
+    # Per thread (`_span`): the part of the session's state the statement
+    # this thread is running sets itself (`_statement`), and whether a dial
+    # made for it left that part out (`_restore_session`). A connection
+    # serialises the round trips of threads that share it, and another
+    # thread's dial is not that statement's.
+    _spans = None
     # The pool that owns this connection (see `ConnectionPool`): told each
     # round trip's latency, each transport failure and each write, and asked
     # for the dial order when the connection re-dials. None outside a pool.
@@ -920,15 +921,16 @@ class Connection:
         database, or under other settings, than the application set.
 
         Except the part the statement this dial is made for sets itself
-        (`_stating`): a `USE` does not first enter the database it leaves.
+        (`_span`): a `USE` does not first enter the database it leaves.
         That database may be gone — dropped while the connection was down —
         and then no statement could ever run again, the `USE` that leaves
         it included. The statement's own answer decides that part; until
-        it has, the session is short of it (`_unrestored`)."""
-        self._unrestored = False
+        it has, the session is short of it."""
+        span = self._span()
+        span.unrestored = False
         if self._database is not None:
-            if self._stating == "use":
-                self._unrestored = True
+            if span.stating == "use":
+                span.unrestored = True
             else:
                 self._use_database(self._database)
         for kind, setting in (
@@ -937,10 +939,22 @@ class Connection:
         ):
             if setting is None:
                 continue
-            if self._stating == kind:
-                self._unrestored = True
+            if span.stating == kind:
+                span.unrestored = True
             else:
                 self._query(setting, self._consistency)
+
+    def _span(self):
+        """This thread's statement on the connection: `stating`, the part
+        of the session's state it sets itself (None outside a statement,
+        and for one that sets none), and `unrestored`, whether a dial made
+        for it left that part out."""
+        spans = self._spans
+        if spans is None:
+            spans = self.__dict__.setdefault("_spans", threading.local())
+        if not hasattr(spans, "stating"):
+            spans.stating, spans.unrestored = None, False
+        return spans
 
     def _use_database(self, db: str) -> None:
         """Enter `db`, and remember it as the session's database."""
@@ -1126,17 +1140,18 @@ class Connection:
         database, or the settings, the driver has noted."""
         noted = _session_statement(sql)
         what = noted[0] if noted else None
-        outer, self._stating = self._stating, what
+        span = self._span()
+        outer, span.stating = span.stating, what
         try:
             self._look()
             yield what
         except BaseException:
-            if self._unrestored:
+            if span.unrestored:
                 self._mark_broken()
             raise
         finally:
-            self._stating = outer
-            self._unrestored = False
+            span.stating = outer
+            span.unrestored = False
 
     def _run(self, sql, fn):
         """Run the statement `sql`, which `fn` sends; if its connection

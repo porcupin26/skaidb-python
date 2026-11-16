@@ -11,6 +11,7 @@ Against the fake server of `test_transactions`, which keeps each session's
 database and says which one every statement ran in (`ran_in`).
 """
 
+import threading
 import unittest
 
 import skaidb
@@ -329,6 +330,33 @@ class LeavingADatabase(_Case):
         self.assertEqual(self.server.log[-2:], [(1, "USE other"), (2, "USE other")])
         conn.execute(COUNT)
         self.assertEqual(self.server.ran_in[-1], ("other", COUNT))
+
+    def test_only_the_dials_of_that_use_leave_the_database_out(self):
+        # A connection serialises the round trips of threads that share it.
+        # While one thread is inside its `USE`, a dial made by another —
+        # for its own statement, or a reconnect() — is not that USE's: it
+        # enters the noted database like any other dial.
+        conn = self.connect()
+        conn.execute("USE app")
+        inside, done = threading.Event(), threading.Event()
+
+        def use_in_flight():
+            with conn._statement("USE other"):
+                inside.set()
+                done.wait(5)
+
+        other = threading.Thread(target=use_in_flight)
+        other.start()
+        try:
+            self.assertTrue(inside.wait(5))
+            conn.reconnect()
+        finally:
+            done.set()
+            other.join(5)
+        self.assertEqual(self.server.log[-1], (2, 'USE "app"'), "left in the default database")
+        conn.execute(COUNT)
+        self.assertEqual(self.server.ran_in[-1], ("app", COUNT))
+        self.assertEqual(self.server.connections, 2, "the other thread's span cost the connection")
 
     def test_a_setting_is_not_held_hostage_by_the_one_it_replaces(self):
         # The same rule for the other notes: a `SET` that replaces a setting
