@@ -54,8 +54,8 @@ with skaidb.connect(host="localhost", user="skaidb", password="secret") as conn:
 
 ## Table of contents
 
-- [Connecting](#connecting) — host/port, seeds and failover, `database=`,
-  timeouts, TLS, consistency, health checks
+- [Connecting](#connecting) — host/port, seeds and failover, session state
+  (`database=`, `USE`, `SET`), timeouts, TLS, consistency, health checks
 - [Statements and parameters](#statements-and-parameters) — `?` binding,
   prepared statements, type mapping, `executemany`
 - [Cursors](#cursors) — fetch methods, `description`, `rowcount`, multiple
@@ -65,7 +65,7 @@ with skaidb.connect(host="localhost", user="skaidb", password="secret") as conn:
 - [Connection pool](#connection-pool)
 - [Streams (`CREATE STREAM`)](#streams-create-stream) — `subscribe()`
 - [Transactions](#transactions) — `transaction()`, conflicts and the retry,
-  the two rules
+  `BEGIN` … `COMMIT` by hand, `commit()` / `rollback()`, the two rules
 - [Errors](#errors)
 - [Thread safety](#thread-safety)
 - [Compatibility](#compatibility)
@@ -91,9 +91,10 @@ skaidb.connect(
 
 `connect()` dials, runs the SCRAM-SHA-256 handshake (with mutual
 authentication — the server proves it knows your password too), sends a
-best-effort `Hello` naming the driver and its version, and runs `USE` if a
-`database` was given. Omit `user`/`password` for a server with authentication
-disabled.
+`Hello` naming the driver and its version, and runs `USE` if a `database`
+was given. A seed that fails anywhere on the way — the dial, the handshake,
+an unanswered `Hello` — is passed over for the next one. Omit
+`user`/`password` for a server with authentication disabled.
 
 ### Seeds and failover
 
@@ -107,28 +108,35 @@ conn = skaidb.connect(seeds=["db1", "db2:7000", "db3"], database="app")
 
 Each seed is `"host"` or `"host:port"` (the port after the last colon wins;
 for an IPv6 literal use `host=`/`port=` instead). `conn.reconnect()` re-dials
-across the same seeds, re-authenticates and enters the connection's
-[database](#the-session-database) again, discarding its prepared statements.
+across the same seeds, re-authenticates and puts the connection's
+[session state](#session-state) back, discarding its prepared statements.
 
 **Automatic reconnect** (`auto_reconnect=True`, the default). When a node
 goes away (a rolling restart, a crash), the statement whose connection
 failed re-dials and runs once more, trying the OTHER seeds before the one
 that just failed; a connection already broken re-dials before its next
 statement. Prepared statements are re-prepared on the new connection, so
-`executemany` survives a failover too, and the new connection enters the
-[database](#the-session-database) the old one was in before anything else
-is sent. The retry repeats the whole
-statement, so one the old node had already applied can run twice
-(at-least-once on failover). Most writes are idempotent — a plain `INSERT`
-replaces the row with the same primary key, and `DELETE` or an `UPDATE` that
-sets fixed values lands the same row twice — but a statement that computes
-from the current row does not: `UPDATE … SET n = n + 1`, `INSERT … ON
-CONFLICT DO UPDATE SET n = n + 1`, or a row keyed by a sequence. Run those
-with `auto_reconnect=False` (or make them idempotent). A stream cannot be
-retried mid-way, and nothing re-dials while `conn.transaction()` has its
-transaction open: it lives on the connection that failed (see
-[transactions](#transactions)). Pass `auto_reconnect=False` to handle
-`OperationalError` yourself.
+`executemany` survives a failover too, and the new connection gets the
+[session state](#session-state) of the old one — its database, its
+consistency override, its scan budget — before anything else is sent.
+
+A connection the server closed while it sat **idle** — a restart, a
+failover, an idle timeout — costs no statement at all: before a statement's
+first request the driver looks at the socket (no round trip), and replaces
+a connection that is closed, reset or holds bytes nobody asked for before
+anything is written to it.
+
+The retry after a failure in transit repeats the whole statement, so one
+the old node had already applied can run twice (at-least-once on failover).
+Most writes are idempotent — a plain `INSERT` replaces the row with the same
+primary key, and `DELETE` or an `UPDATE` that sets fixed values lands the
+same row twice — but a statement that computes from the current row does
+not: `UPDATE … SET n = n + 1`, `INSERT … ON CONFLICT DO UPDATE SET n = n +
+1`, or a row keyed by a sequence. Run those with `auto_reconnect=False` (or
+make them idempotent). A stream cannot be retried mid-way, and nothing
+re-dials while a [transaction](#transactions) is open — `conn.transaction()`'s
+or one begun with a `BEGIN` statement: it lives on the connection that
+failed. Pass `auto_reconnect=False` to handle `OperationalError` yourself.
 
 **Certificate login.** With `auth_mechanism="certificate"` and
 `tls_client_cert` / `tls_client_key`, the TLS client certificate is the
@@ -136,26 +144,43 @@ credential: its Common Name is the user (pass `user` only to assert it), and
 no password is sent. The server needs `auth.x509_enabled` and a CA that
 signed the certificate.
 
-### The session database
+### Session state
 
-`database="app"` enters the database as part of connecting. A `USE` sent as
-a statement works too, and replaces it:
+A session on the server carries state beyond its statements: the database it
+is in, a consistency override and a scan budget. All of it lives on the
+connection, and a new connection has none — so the driver notes what the
+server accepted and puts it back on every re-dial, before anything else is
+sent.
 
 ```python
 conn = skaidb.connect(host="db1", database="app")
-conn.execute("USE archive")       # the connection is in `archive` from here on
+conn.execute("USE archive")              # the connection is in `archive` from here on
+conn.execute("SET CONSISTENCY ALL")      # every statement runs at ALL …
+conn.execute("SET SCAN BUDGET ROWS 5000")  # … and may examine 5000 rows at most
 ```
 
-A new session on the server starts in no database, where a bare table name
-resolves in the default one. So the connection remembers the database it is
-in — the one given to `connect()`, then the one named by the last `USE` the
-server accepted — and enters it again on every re-dial, before anything else
-is sent. If the database cannot be entered on the new connection, the
-statement fails with that error; it never runs in another database. A `USE`
-is recognised when it is the whole statement: `USE [DATABASE] name`, the
-name bare or in double quotes (`""` for a quote inside), with an optional
-trailing `;` — `--` comments around it are skipped, as the server skips
-them.
+- **The database** — the one given to `connect()`, then the one named by the
+  last `USE` the server accepted. A `USE` is recognised when it is the whole
+  statement: `USE [DATABASE] name`, the name bare or in double quotes (`""`
+  for a quote inside).
+- **`SET CONSISTENCY { ONE | QUORUM | ALL }`** — the last one the server
+  accepted; `SET CONSISTENCY DEFAULT` (server >= 0.349) clears it.
+- **`SET SCAN BUDGET …`** — the last one the server accepted; `SET SCAN
+  BUDGET DEFAULT` clears it.
+
+Each is read when it is exactly one statement, in any letter case, with an
+optional trailing `;` — `--` comments around it are skipped, as the server
+skips them. After a re-dial the new connection enters the database, then
+gets the consistency override, then the scan budget. If one of them is
+refused there, the statement fails with that error and the connection stays
+broken: nothing runs in another database, at another consistency or past the
+limit you set.
+
+A `USE` is never held up by the database it leaves: when the statement that
+re-dials is itself a `USE` (or a `SET` that replaces a setting), the driver
+does not first put back what the statement is about to replace. So after the
+session's database was dropped, every statement fails with the `USE` error —
+and `USE other` gets out of it.
 
 ### Timeouts
 
@@ -208,23 +233,28 @@ DDL is always run at quorum by the server regardless of this setting.
 
 - `conn.is_usable()` — no round-trip. `True` unless the connection is closed,
   was left out of sync by a transport error or an undrainable abandoned
-  stream, or is currently mid-stream.
+  stream, is currently mid-stream, or was closed by the server while it sat
+  idle (a look at the socket that does not wait; a connection found so is
+  marked broken).
 - `conn.ping()` — a real round-trip (`SHOW DATABASES`); `False` when it
   fails (a transport failure also marks the connection broken).
 - `conn.reconnect()` — re-dial (failing over across seeds), re-authenticate
-  and enter the database again.
+  and put the session state back. Refused while a transaction is open.
 - `conn.closed` — `True` after `close()`.
 
 A connection is marked **broken** when its socket is dead or out of step with
-the server: a transport error or a read timeout, an abandoned stream too long
-to drain, a re-dial that did not finish, or a statement stopped between its
-request and its reply by anything else — a `KeyboardInterrupt`, an exception
-raised by a signal handler — which propagates unchanged. The socket is closed
+the server: a transport error or a read timeout, a close or stray bytes found
+on it while it was idle, an abandoned stream too long to drain, a re-dial
+that did not finish, or a statement stopped between its request and its
+reply by anything else — a `KeyboardInterrupt`, an exception raised by a
+signal handler — which propagates unchanged. The socket is closed
 at that moment, not at the next statement: replies carry no request id, so
 one left unread would answer the next statement, and until the socket closes
 the server keeps the session and any transaction open in it. With
 `auto_reconnect` the next statement re-dials first; without it, statements
-raise `OperationalError` until `reconnect()`.
+raise `OperationalError` until `reconnect()`. Either way a connection that
+broke with a [transaction](#transactions) open first has that transaction
+ended by the application.
 
 ## Statements and parameters
 
@@ -301,8 +331,8 @@ print(cur.rowcount)   # total rows affected
 
 The statement is prepared once and **every parameter row ships in a single
 frame** (`ExecuteBatch`). Outside a transaction each row commits on its own:
-on a failure the `ProgrammingError` names the row index and earlier rows stay
-applied. Servers
+on a failure the `ProgrammingError` names the row (`batch row 1: … (1 rows
+applied before it)`) and earlier rows stay applied. Servers
 without the batch opcode, and statements that cannot be prepared, fall back to
 a per-row loop automatically.
 
@@ -385,9 +415,12 @@ and `read_your_writes=<seconds>` with `pool.connection(affinity=key)`;
 blocks — when no idle connection is available a new one is dialed, and a
 returned connection beyond `maxsize` is closed. Connections are validated with
 `is_usable()` on checkout and check-in, so one broken by a transport error or
-an undrained stream is closed and replaced transparently. A pool made with
-`database=` hands every connection out in that database, also one its last
-borrower left in another with a `USE`. Details:
+an undrained stream, or closed by its member while it sat idle, is closed
+and replaced transparently. Every borrower gets a connection in the pool's
+own [session state](#session-state): in the pool's database (`database=`, or
+`default` without it), with no consistency override, no scan budget and no
+transaction open — what a borrower changed is put back when its connection
+comes back. Details:
 [docs/pooling.md](https://github.com/porcupin26/skaidb-python/blob/main/docs/pooling.md).
 
 ## Streams (`CREATE STREAM`)
@@ -472,6 +505,14 @@ except skaidb.TransactionConflict:
     ...                                   # nothing was applied: run it again from BEGIN
 ```
 
+`conn.commit()` and `conn.rollback()`, the DB-API methods, end a transaction
+begun that way: with one open they send `COMMIT` / `ROLLBACK` and raise what
+the statement raises; with none open they are accepted and send nothing —
+every statement has committed on its own — so calling them as a matter of
+routine costs nothing. (Inside `transaction()` the helper ends its
+transaction: `commit()` sends nothing there, and `rollback()` raises — a
+body rolls back by raising.)
+
 Two rules hold for both forms:
 
 - **One connection for the whole transaction.** The transaction belongs to
@@ -480,20 +521,26 @@ Two rules hold for both forms:
   duration (`pool.transaction(body)`, or one `with pool.connection() as conn:`
   block) and use only the connection you were given. The automatic reconnect
   would break this rule — a statement retried on a fresh connection runs
-  outside the transaction — so `transaction()` switches it off from the
-  answer to `BEGIN` until its transaction has ended, and refuses
-  `conn.reconnect()` in the body (`ProgrammingError`): a lost connection ends
-  the transaction, and the caller runs it again. For a hand-written
-  transaction, connect with `auto_reconnect=False`.
+  outside the transaction — so the connection notes a transaction, from a
+  `BEGIN` the server accepted until `COMMIT` or `ROLLBACK` is answered, and
+  does not re-dial while one is open (nor accept `conn.reconnect()`:
+  `ProgrammingError`). That holds for `transaction()` and for a `BEGIN` you
+  send yourself alike.
 - **Stop if `BEGIN` fails.** When the opening statement raises, no
   transaction is open and every statement after it would commit on its own.
   `transaction()` raises that error without calling the body.
 
-The DB-API methods send nothing: `conn.commit()` is an accepted no-op for
-DB-API conformance, and `conn.rollback()` raises `OperationalError`, since
-silently dropping a rollback would be worse than refusing it. End a
-transaction with `transaction()` or with the `COMMIT` / `ROLLBACK`
-statements.
+**When the connection is lost inside a transaction**, the transaction is
+gone with it — the server discards it — and nothing of it was committed.
+The statement under which it was lost raises `OperationalError`, and so does
+every statement after it, unsent: on a new connection each would commit on
+its own. `transaction()` reports the loss and is done. A transaction written
+by hand is ended where it is: `ROLLBACK` (or `conn.rollback()`) succeeds
+without being sent, `COMMIT` (or `conn.commit()`) raises an
+`OperationalError` saying that nothing was committed. After either, the next
+statement re-dials as usual. The one case with an unknown outcome is a
+connection lost under the `COMMIT` itself — the server may have applied it
+before its reply went missing — and that error says so instead.
 
 ## Errors
 
@@ -502,21 +549,25 @@ Exception
 └── skaidb.Error
     ├── skaidb.InterfaceError        # malformed/unexpected frames
     └── skaidb.DatabaseError
-        ├── skaidb.OperationalError  # dial/auth/transport failures, broken connection, rollback()
+        ├── skaidb.OperationalError  # dial/auth/transport failures, broken connection,
+        │                            # a connection lost inside a transaction
         └── skaidb.ProgrammingError  # the server rejected the statement; bad parameters;
             │                        # closed connection; statement while streaming;
-            │                        # reconnect() inside transaction()
+            │                        # reconnect() with a transaction open
             └── skaidb.TransactionConflict  # the server refused a COMMIT: another
                                             # writer changed a row the transaction writes
 ```
 
 - A server `Error` frame is a **statement** error (`ProgrammingError`); the
   connection stays usable. One whose message starts with `transaction
-  conflict:` is a `TransactionConflict` (see [transactions](#transactions)).
+  conflict:` is a `TransactionConflict` (see [transactions](#transactions)) —
+  in a batch, where the server names the failing row first, the row's error
+  is what is read.
 - A transport failure (`OperationalError`) marks the connection broken and
   closes its socket. With `auto_reconnect` (the default) the failed statement
   re-dials and retries once; otherwise call `reconnect()` or let the pool
-  replace it.
+  replace it. Inside a transaction nothing re-dials: see
+  [transactions](#transactions).
 - Anything else that stops a statement between its request and its reply —
   a `KeyboardInterrupt`, a `SystemExit`, an exception raised by a signal
   handler — propagates unchanged and costs the connection in the same way:
@@ -537,8 +588,11 @@ which is what a [pool](#connection-pool) gives you.
 - Python 3.8 – 3.14, CPython and PyPy. No dependencies.
 - Works with any skaidb server. Where a server predates an opcode the driver
   falls back: prepared statements → client-side text binding, `ExecuteBatch`
-  → per-row execution, `Hello` → ignored. `stream()` needs a server with the
-  streaming opcode and raises `ProgrammingError` otherwise.
+  → per-row execution, `Hello` → its refusal ignored. `stream()` needs a
+  server with the streaming opcode and raises `ProgrammingError` otherwise.
+  `SET CONSISTENCY DEFAULT` needs server 0.349: an older one refuses it, and
+  a pool then closes a connection whose borrower set a consistency instead
+  of handing it on.
 - The wire protocol (framing, SCRAM handshake, value encoding, opcodes) is
   specified at <https://skaidb.org/docs/PROTOCOL.html>. The driver speaks the
   binary protocol on port 7000; the server's REST/JSON gateway (port 7080)

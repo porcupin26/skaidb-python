@@ -35,8 +35,8 @@ ConnectionPool.closed: bool
 every new connection is dialed with the `connect()` ones, so pooled
 connections inherit `database=`, timeouts, TLS, the default consistency and
 automatic reconnect (a pooled connection re-dials in the pool's order:
-usable members first, the one it lost last — and enters its database again
-before anything else is sent).
+usable members first, the one it lost last — and gets its session state
+back before anything else is sent).
 
 ## Balancing across members
 
@@ -123,13 +123,13 @@ logger. The rules are the same in every skaidb driver
   the loop tries the next — and on check-in — a broken or mid-stream
   connection is closed instead of pooled. `pool.connection()` does the
   check-in for you, closing the connection if a transport error broke it.
-- **Idle connections are not health-checked by round-trip.** A server
-  restart leaves idle sockets that look usable until the first statement.
-  With automatic reconnect (the default) that statement re-dials — in the
-  pool's order — and runs once more, so the caller sees nothing; with
-  `auto_reconnect=False` it raises `OperationalError`, the connection is
-  marked broken and the pool discards it on check-in. `conn.ping()` after
-  checkout (one round-trip) tells beforehand.
+- **A connection closed while it sat idle is not handed out.** A member's
+  restart, a failover or an idle timeout closes idle connections.
+  `is_usable()` looks at the socket without waiting — a close, a reset or
+  stray bytes mean the connection is dead — so the checkout discards such a
+  connection and gives a working one, with or without `auto_reconnect`. No
+  round trip is spent on it; `conn.ping()` after checkout (one round-trip)
+  asks the server itself.
 - **Prepared statements are per connection.** Each pooled connection keeps
   its own cache (240 statements), so a hot statement is prepared once per
   connection, not once per pool.
@@ -148,18 +148,34 @@ is closed rather than reused (its socket still has rows queued). A stream
 abandoned with more than 64 frames in flight marks the connection broken,
 and the pool replaces it. See [streaming.md](streaming.md).
 
-## Databases and the pool
+## Session state and the pool
 
-A pool made with `database="app"` hands every connection out in `app`. A
-borrower may still send `USE other` on its checkout — the connection stays
-in `other` for that checkout, also across a re-dial — and the pool puts the
-connection back in `app` before the next borrower gets it: one `USE` round
-trip at that checkout, only for a connection that was moved. If that fails,
-the connection is closed and another is used.
+A pooled connection reaches each borrower in the pool's own session state:
 
-A pool made without `database=` has no database of its own to restore: a
-connection stays in the database its last borrower entered. Either give the
-pool its database, or send `USE` at the start of every checkout.
+- in the pool's database — `database="app"` hands every connection out in
+  `app`; a pool made without `database=` hands it out in `default`, the
+  database every new connection starts in;
+- with no consistency override (`SET CONSISTENCY`) and no scan budget (`SET
+  SCAN BUDGET`) of an earlier borrower;
+- with no transaction open.
+
+A borrower may change all of it on its checkout — `USE other`, `SET SCAN
+BUDGET ROWS 1000`, `SET CONSISTENCY ALL`, `BEGIN` — and it holds for that
+checkout, across a re-dial too. When the connection comes back, the pool
+puts back what the borrower changed before anyone else can get it:
+`ROLLBACK` for a transaction left open, `USE` for the database, `SET SCAN
+BUDGET DEFAULT`, `SET CONSISTENCY DEFAULT`. Only the ones that are needed
+are sent, so a borrower that changed nothing costs no round trip. If one of
+them fails, the connection is closed instead of pooled, and the next
+checkout uses another.
+
+Two consequences:
+
+- On a pool without `database=`, a `USE` does not outlive its checkout.
+  Give the pool its database, or send `USE` at the start of every checkout.
+- `SET CONSISTENCY DEFAULT` needs server 0.349. An older server refuses it,
+  so there a connection whose borrower set a consistency is closed when it
+  comes back, and the next borrower gets a new one.
 
 ## Transactions and the pool
 
@@ -186,12 +202,17 @@ connection is discarded on check-in. A transaction whose opening statement
 finds the connection dead (it sat idle while the member restarted) re-dials
 like any statement and runs.
 
+The same holds for a transaction a borrower writes itself, `BEGIN` to
+`COMMIT`, on its checkout: the connection does not re-dial while it is open.
+One left open when the connection comes back is rolled back before the
+connection is pooled.
+
 ## Retrying
 
 With automatic reconnect (the default) the driver retries once on its own: a
 statement whose connection fails in transit re-dials, the other members
 first, and runs again. It does not retry a second failure, a stream, or
-anything inside `transaction()`, and with `auto_reconnect=False` it retries
+anything inside a transaction, and with `auto_reconnect=False` it retries
 nothing. A pattern for those cases, which takes a fresh connection per
 attempt:
 

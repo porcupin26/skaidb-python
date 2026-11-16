@@ -48,7 +48,8 @@ conn = skaidb.connect(host="localhost", user="skaidb", password="secret",
 ```
 
 Either way the connection remembers its database and enters it again
-whenever it has to re-dial.
+whenever it has to re-dial — and likewise a `SET CONSISTENCY` or `SET SCAN
+BUDGET` you sent (see [session state](api.md#session-state)).
 
 ## Create a table and write rows
 
@@ -141,7 +142,9 @@ statement is a `skaidb.ProgrammingError` and the connection stays usable. A
 transport failure is a `skaidb.OperationalError` and costs the connection its
 socket: by default the driver re-dials and runs the statement once more, and
 re-dials before the next statement otherwise (`auto_reconnect=False` leaves
-that to you: `conn.reconnect()`, or a pool). See [api.md#errors](api.md#errors).
+that to you: `conn.reconnect()`, or a pool). Inside a transaction nothing
+re-dials — it was on the connection that is gone: see
+[transactions](api.md#transactions). See [api.md#errors](api.md#errors).
 
 ## Next
 
