@@ -35,7 +35,8 @@ ConnectionPool.closed: bool
 every new connection is dialed with the `connect()` ones, so pooled
 connections inherit `database=`, timeouts, TLS, the default consistency and
 automatic reconnect (a pooled connection re-dials in the pool's order:
-usable members first, the one it lost last).
+usable members first, the one it lost last — and enters its database again
+before anything else is sent).
 
 ## Balancing across members
 
@@ -91,9 +92,10 @@ from flask import session
 
 def db():
     return pool.connection(affinity=session.get("_user_id"))  # no query to get the key
-``` A
-statement is a write unless it starts with `SELECT`, `SHOW`, `EXPLAIN`,
-`DESCRIBE`, `VALUES`, `WITH` or `USE`.
+```
+
+A statement is a write unless it starts with `SELECT`, `SHOW`, `EXPLAIN`,
+`DESCRIBE`, `DESC`, `VALUES`, `WITH` or `USE`.
 
 **Watching it.** `pool.members()` returns one dict per member:
 
@@ -122,11 +124,12 @@ logger. The rules are the same in every skaidb driver
   connection is closed instead of pooled. `pool.connection()` does the
   check-in for you, closing the connection if a transport error broke it.
 - **Idle connections are not health-checked by round-trip.** A server
-  restart leaves idle sockets that look usable until the first statement,
-  which then fails with `OperationalError` and marks the connection broken;
-  the pool discards it on check-in. If you need a guarantee, call
-  `conn.ping()` after checkout (one round-trip) or wrap the first statement
-  in a retry that takes a fresh connection.
+  restart leaves idle sockets that look usable until the first statement.
+  With automatic reconnect (the default) that statement re-dials — in the
+  pool's order — and runs once more, so the caller sees nothing; with
+  `auto_reconnect=False` it raises `OperationalError`, the connection is
+  marked broken and the pool discards it on check-in. `conn.ping()` after
+  checkout (one round-trip) tells beforehand.
 - **Prepared statements are per connection.** Each pooled connection keeps
   its own cache (240 statements), so a hot statement is prepared once per
   connection, not once per pool.
@@ -144,6 +147,19 @@ before the `pool.connection()` block exits; a connection returned mid-stream
 is closed rather than reused (its socket still has rows queued). A stream
 abandoned with more than 64 frames in flight marks the connection broken,
 and the pool replaces it. See [streaming.md](streaming.md).
+
+## Databases and the pool
+
+A pool made with `database="app"` hands every connection out in `app`. A
+borrower may still send `USE other` on its checkout — the connection stays
+in `other` for that checkout, also across a re-dial — and the pool puts the
+connection back in `app` before the next borrower gets it: one `USE` round
+trip at that checkout, only for a connection that was moved. If that fails,
+the connection is closed and another is used.
+
+A pool made without `database=` has no database of its own to restore: a
+connection stays in the database its last borrower entered. Either give the
+pool its database, or send `USE` at the start of every checkout.
 
 ## Transactions and the pool
 
@@ -166,15 +182,21 @@ one run on another checkout is outside the transaction and commits on its
 own. A `TransactionConflict` is a statement error: the connection goes back
 to the pool and nothing counts against its member. A connection lost
 mid-transaction is not re-dialed — the `OperationalError` is raised and the
-connection is discarded on check-in.
+connection is discarded on check-in. A transaction whose opening statement
+finds the connection dead (it sat idle while the member restarted) re-dials
+like any statement and runs.
 
 ## Retrying
 
-The driver does not retry on its own. A pattern that copes with a node going
-away:
+With automatic reconnect (the default) the driver retries once on its own: a
+statement whose connection fails in transit re-dials, the other members
+first, and runs again. It does not retry a second failure, a stream, or
+anything inside `transaction()`, and with `auto_reconnect=False` it retries
+nothing. A pattern for those cases, which takes a fresh connection per
+attempt:
 
 ```python
-def run(sql, params=None, attempts=2):
+def run(sql, params=None, attempts=3):
     for i in range(attempts):
         with pool.connection() as conn:
             try:
@@ -183,9 +205,10 @@ def run(sql, params=None, attempts=2):
                 if i == attempts - 1:
                     raise
                 # the broken connection is discarded on exit; the next
-                # checkout dials a fresh one across the seed list
+                # checkout dials a fresh one in the pool's order
 ```
 
-Because skaidb autocommits per statement, retrying a write can apply it
-twice unless the statement is idempotent (an `INSERT` with a fixed primary
-key, an `UPDATE` to a value, a `DELETE`). Prefer idempotent writes.
+Outside a transaction every statement commits on its own, so a retried
+write — the driver's or yours — can apply twice unless the statement is
+idempotent (a plain `INSERT`, which replaces the row with the same primary
+key, an `UPDATE` to a fixed value, a `DELETE`). Prefer idempotent writes.

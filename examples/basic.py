@@ -1,6 +1,6 @@
 """Runnable example for the skaidb Python driver.
 
-    python3 example.py [host] [port] [user] [password]
+    python3 examples/basic.py [host] [port] [user] [password]
 """
 import sys
 import skaidb

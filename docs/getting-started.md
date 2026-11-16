@@ -47,6 +47,9 @@ conn = skaidb.connect(host="localhost", user="skaidb", password="secret",
                       database="app")          # runs USE "app" on connect
 ```
 
+Either way the connection remembers its database and enters it again
+whenever it has to re-dial.
+
 ## Create a table and write rows
 
 Placeholders are `?`. Values are bound as typed values through a server-side
@@ -80,7 +83,7 @@ for row in cur:            # the rest
 
 Rows are tuples. Values come back as native Python types (`int`, `str`,
 `list`, `dict`, `decimal.Decimal`, `uuid.UUID`, tz-aware UTC `datetime`, …);
-see the [type mapping](api.md#type-mapping).
+see the [type mapping](api.md#parameters-and-type-mapping).
 
 ## Read a big result without loading it
 
@@ -134,9 +137,11 @@ See [tls.md](tls.md) for the three modes and the server-name check.
 ## Errors
 
 Everything the driver raises derives from `skaidb.Error`. A rejected
-statement is a `skaidb.ProgrammingError` and the connection stays usable; a
-transport failure is a `skaidb.OperationalError` and the connection must be
-reconnected or replaced. See [api.md#errors](api.md#errors).
+statement is a `skaidb.ProgrammingError` and the connection stays usable. A
+transport failure is a `skaidb.OperationalError` and costs the connection its
+socket: by default the driver re-dials and runs the statement once more, and
+re-dials before the next statement otherwise (`auto_reconnect=False` leaves
+that to you: `conn.reconnect()`, or a pool). See [api.md#errors](api.md#errors).
 
 ## Next
 

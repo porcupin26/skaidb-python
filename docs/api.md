@@ -19,7 +19,7 @@ Contents: [module globals](#module-globals) · [`connect()`](#connect) ·
 | `apilevel` | `"2.0"` | DB-API level |
 | `threadsafety` | `1` | threads may share the module, not connections |
 | `paramstyle` | `"qmark"` | `?` placeholders, positional |
-| `__version__` | e.g. `"1.0.0"` | the installed package version (read from distribution metadata; falls back to the in-module literal when running from an uninstalled checkout). Reported to the server in the Hello frame. |
+| `__version__` | e.g. `"1.5.1"` | the installed package version (read from distribution metadata; falls back to the in-module literal when running from an uninstalled checkout). Reported to the server in the Hello frame. |
 
 ## `connect()`
 
@@ -39,15 +39,19 @@ skaidb.connect(
     tls_ca: str | None = None,
     tls_insecure: bool = False,
     tls_server_name: str = "skaidb",
+    tls_client_cert: str | None = None,
+    tls_client_key: str | None = None,
+    auth_mechanism: str = "scram",
+    auto_reconnect: bool = True,
 ) -> Connection
 ```
 
-Opens a connection and runs the SCRAM-SHA-256 handshake. What happens, in
-order: resolve the endpoint list (`seeds`, or the single `host:port`) and
-shuffle it; for each endpoint until one succeeds: TCP connect (with
-`TCP_NODELAY`), optional TLS wrap, SCRAM handshake; then send `Hello`
-(best-effort, ignored by old servers) and `USE "<database>"` if `database`
-was given.
+Opens a connection and authenticates. What happens, in order: resolve the
+endpoint list (`seeds`, or the single `host:port`) and shuffle it; for each
+endpoint until one succeeds: TCP connect (with `TCP_NODELAY`), optional TLS
+wrap, the SCRAM-SHA-256 handshake (or, with `auth_mechanism="certificate"`,
+the certificate login); then send `Hello` (best-effort, ignored by old
+servers) and `USE "<database>"` if `database` was given.
 
 The server records the driver name and `__version__` carried by `Hello` in
 its `drivers` table **asynchronously**: `Hello` is acknowledged before the
@@ -62,16 +66,18 @@ health check depends on the row.
 | `consistency` | `"ONE"`, `"QUORUM"`, `"ALL"` (case-insensitive) or `Consistency.ONE/QUORUM/ALL`. Default for every statement on the connection; cursors and streams can override. `ValueError` on anything else. |
 | `timeout` | Default for both the dial timeout and the socket read timeout, in seconds. **`None` means no timeout at all**: a dial to a black-holed host and a read from a silent peer both block forever, including the drain an abandoned stream performs. |
 | `connect_timeout`, `read_timeout` | Override the dial / read bound separately; each falls back to `timeout` when `None`. |
-| `database` | Runs `USE "<database>"` (identifier-quoted) as part of connecting. |
+| `database` | Runs `USE "<database>"` (identifier-quoted) as part of connecting, and of every re-dial. A `USE` statement the server accepts later replaces it: see [the session database](#the-session-database). |
 | `seeds` | `"host"` or `"host:port"` strings tried in randomized order; the port after the **last** colon is used, bare names get `port`. IPv6 literals: use `host=`/`port=`. |
 | `tls`, `tls_ca`, `tls_insecure`, `tls_server_name` | See [tls.md](tls.md). Any of the first three enables TLS. |
-| `tls_client_cert`, `tls_client_key` | PEM files of a client certificate to present over TLS (enables TLS). Needed for `auth_mechanism="certificate"`. |
+| `tls_client_cert`, `tls_client_key` | PEM files of a client certificate to present over TLS (enables TLS). Needed for `auth_mechanism="certificate"`. Giving one without the other raises `ProgrammingError`. |
 | `auth_mechanism` | `"scram"` (default: `user`/`password`) or `"certificate"` (EXTERNAL: the client certificate's Common Name is the user; the server needs `auth.x509_enabled`). |
-| `auto_reconnect` | Default `True`. After a transport failure the next statement re-dials first, and a statement whose connection fails in transit re-dials — trying the other endpoints before the failed one — and runs once more (whole statement, prepare included; at-least-once on failover: a plain `INSERT` replaces the same row, but `SET n = n + 1`-style or sequence-keyed writes can apply twice). `False` raises `OperationalError` instead. |
+| `auto_reconnect` | Default `True`. After a transport failure the next statement re-dials first, and a statement whose connection fails in transit re-dials — trying the other endpoints before the failed one — and runs once more (whole statement, prepare included; at-least-once on failover: a plain `INSERT` replaces the same row, but `SET n = n + 1`-style or sequence-keyed writes can apply twice). `False` raises `OperationalError` instead. A stream is never retried, and nothing re-dials while [`transaction()`](#transactions) has its transaction open. |
 
 Raises `OperationalError` when no endpoint could be connected and
 authenticated (the message lists every endpoint's failure), including
-`authentication denied` and `server signature mismatch`.
+`authentication denied` and `server signature mismatch`; `ProgrammingError`
+for an unknown `auth_mechanism`, or when the server refuses the `USE` of
+`database`.
 
 ## `Connection`
 
@@ -91,24 +97,32 @@ the cursor. See [`Cursor.execute`](#cursorexecute).
 ### Streaming
 
 ```python
-Connection.stream(sql: str, consistency: int | str | None = None) -> RowStream
+Connection.stream(sql: str, params: Sequence | None = None,
+                  consistency: int | str | None = None) -> RowStream
 ```
 
 Runs `sql` over the streaming opcode and returns a [`RowStream`](#rowstream).
-No parameters (the streaming opcode carries SQL text). `consistency=None`
-uses the connection's level. Outcomes by what the statement produced:
+`params` bind the statement's `?` placeholders as typed values, exactly as
+[`Cursor.execute`](#cursorexecute) binds them (server >= 0.330; without
+parameters the request is the original streaming opcode, which every server
+with streaming knows). `consistency=None` uses the connection's level; a
+consistency passed as the second positional argument, `stream(sql, "ONE")`,
+is still read as the consistency. Outcomes by what the statement produced:
 
 - rows: a live `RowStream` with `columns` filled from the header;
 - a mutation or DDL: an already-finished, empty `RowStream` (`affected`
   holds the mutation's row count);
 - a server error before any row: `ProgrammingError`; a server without the
-  opcode: `ProgrammingError("server does not support streaming: …")`;
+  opcode: `ProgrammingError("server does not support streaming: …")` (or
+  `"… parameterised streaming …"` when `params` were given);
 - a multi-result-set reply (a `CALL` that `EMIT`s, answered in one frame
   even when streamed): an already-finished `RowStream` on the first set;
   `nextset()` walks the rest, as `Cursor.nextset()` does. The connection is
   free at once.
 
-Raises `ProgrammingError` if the connection is already streaming.
+Raises `ProgrammingError` if the connection is already streaming. A stream
+is never retried by the automatic reconnect: a transport failure raises
+`OperationalError`.
 
 ### Streams (`CREATE STREAM`)
 
@@ -134,30 +148,70 @@ Connection.close() -> None
 Connection.closed: bool
 ```
 
-- `is_usable()` is `False` when the connection is closed, **broken** (a
-  transport error, an unparseable frame, or an abandoned stream too long to
-  drain left the socket out of sync) or **mid-stream** (a `RowStream` owns
-  it). Pools use it on checkout and check-in.
-- `ping()` returns `False` and marks the connection broken on any failure.
-- `reconnect()` drops the socket, re-dials (shuffled seeds), re-authenticates,
-  re-sends Hello and `USE`, and clears the prepared-statement cache. Raises
-  `ProgrammingError` on a closed connection.
-- A broken connection never writes into its old socket (it may hold unread
-  frames, and writing into it would read someone else's answer back). With
-  `auto_reconnect` the next statement re-dials first; without it the
-  statement raises `OperationalError("connection is broken …; call
-  reconnect()")`.
-- `reconnect()` tries the other endpoints before the one it was connected
-  to.
+- `is_usable()` is `False` when the connection is closed, **broken** or
+  **mid-stream** (a `RowStream` owns it). Pools use it on checkout and
+  check-in.
+- `ping()` returns `False` when the round trip fails for any reason, and on
+  a connection that is not usable to begin with; a transport failure also
+  marks the connection broken.
+- `reconnect()` drops the socket, re-dials — the other endpoints before the
+  one it was connected to — re-authenticates, re-sends Hello, enters
+  [the session database](#the-session-database) again and clears the
+  prepared-statement cache. Raises `ProgrammingError` on a closed
+  connection, and inside [`transaction()`](#transactions). If it does not
+  finish — no endpoint, the `USE` refused, an interrupt — the connection is
+  left broken.
 - `close()` is idempotent. `with connect(...) as conn:` closes on exit.
+
+### Broken connections
+
+A reply carries no request id: it belongs to a request only because every
+earlier reply was read to its end. So the connection is marked broken, and
+its socket closed at that moment, whenever the socket is dead or out of step
+with the server:
+
+- a transport error or a read timeout — in a statement, in a stream, or
+  while an abandoned stream is drained (`OperationalError`);
+- a frame the driver cannot place (`InterfaceError`), or an abandoned stream
+  too long to drain;
+- anything else that stops a statement between the first byte of its request
+  and the last byte of its reply: a `KeyboardInterrupt`, a `SystemExit` or
+  another exception raised by a signal handler, a green thread's timeout.
+  It propagates unchanged;
+- a re-dial that did not finish, or a `RowStream` left open by the body of
+  `transaction()`.
+
+Closing the socket at once, rather than at the next statement, is also what
+ends the session on the server — with a transaction open in it, or the rest
+of a stream it is still sending. With `auto_reconnect` the next statement
+re-dials first; without it the statement raises `OperationalError("connection
+is broken …; call reconnect()")`. A pool discards a broken connection.
+
+### The session database
+
+A session on the server starts in no database, where a bare table name
+resolves in the default one. The connection remembers the database it is
+in: the `database` given to `connect()`, then the one named by the last
+`USE` statement the server answered with success — through `execute()`, a
+cursor or `stream()`. Every later dial (`reconnect()`, or the automatic
+reconnect) enters it with `USE "<name>"` before anything else is sent. When
+that `USE` is refused on the new connection, the statement fails with the
+server's error (`ProgrammingError`) and the connection stays broken: it
+never runs in another database.
+
+A statement is read as a `USE` when it is exactly one `USE [DATABASE] <name>`
+— the name bare (letters, digits, `_`) or in double quotes with `""` for a
+quote inside — with an optional trailing `;`, in any letter case. Anything
+else (a comment after it, two statements in one string) is left alone, and
+the connection keeps re-entering the database it knew.
 
 ### Transactions
 
 ```python
 Connection.transaction(body: Callable[[Connection], T],
                        attempts: int = 3, begin: str = "BEGIN") -> T
-Connection.commit() -> None     # no-op
-Connection.rollback() -> None   # raises OperationalError
+Connection.commit() -> None     # sends nothing
+Connection.rollback() -> None   # sends nothing; raises OperationalError
 ```
 
 A transaction is statements on one connection: `BEGIN`, the statements, then
@@ -188,20 +242,27 @@ While the transaction is open — from the answer to `begin` until `COMMIT` or
 `ROLLBACK` has been answered — the connection does not re-dial, whatever
 `auto_reconnect` says: a transport failure raises `OperationalError`,
 because a statement retried on a fresh connection would run outside the
-transaction. `begin` itself re-dials like any other statement (nothing is
-open yet), and once `transaction()` has returned or raised the connection
-reconnects as usual.
+transaction. For the same reason `reconnect()` called from the body raises
+`ProgrammingError`. `begin` itself re-dials like any other statement
+(nothing is open yet), and once `transaction()` has returned or raised the
+connection reconnects as usual. A connection lost under a statement of the
+body means nothing was committed; lost under the `COMMIT` itself, the
+outcome is unknown — the server may have applied it before its reply went
+missing — and the `OperationalError` claims neither.
 
 Finish or close any `RowStream` the body opens before it returns. While one
 is open neither `COMMIT` nor `ROLLBACK` can be sent (`ProgrammingError`, or
-the body's own exception), and the connection is marked broken rather than
-left inside an open transaction.
+the body's own exception), and the connection is marked broken — its socket
+closed, which ends the transaction on the server — rather than left inside
+an open transaction. The stream ends there too.
 
-`commit()` exists for DB-API conformance and does nothing; `rollback()`
-raises rather than silently doing nothing. Neither sends a statement.
-`BEGIN`/`COMMIT`/`ROLLBACK` can also be sent as ordinary statements: keep
-them on one connection opened with `auto_reconnect=False`, and send nothing
-more if `BEGIN` fails.
+`commit()` exists for DB-API conformance: it is accepted and sends nothing,
+so it does not commit a transaction opened with `BEGIN`. `rollback()` raises
+`OperationalError` rather than silently doing nothing, and sends nothing
+either. End a transaction with `transaction()`, or send
+`BEGIN`/`COMMIT`/`ROLLBACK` as ordinary statements
+(`conn.execute("COMMIT")`): keep them on one connection opened with
+`auto_reconnect=False`, and send nothing more if `BEGIN` fails.
 
 ## `Cursor`
 
@@ -247,9 +308,10 @@ Cursor.executemany(sql: str, seq_of_params: Iterable[Sequence]) -> None
 
 Prepares `sql` once and sends every parameter row in **one frame**
 (`ExecuteBatch`). `rowcount` is the total rows affected (`-1` if the server
-answered DDL). Each row autocommits; if a row fails the `ProgrammingError`
-names its index and earlier rows stay applied. Every row's length is
-validated against the statement's parameter count before anything is sent.
+answered DDL). Outside a transaction each row commits on its own: if a row
+fails the `ProgrammingError` names its index and earlier rows stay applied.
+Every row's length is validated against the statement's parameter count
+before the batch is sent.
 Falls back to a per-row `execute()` loop for unpreparable statements and for
 servers that predate the opcode. An empty sequence sets `rowcount = 0` and
 sends nothing.
@@ -291,9 +353,15 @@ with conn.stream(sql) as rows: ...  # close() on exit
   connection. A server error after the header raises `ProgrammingError` from
   `next()`; rows already yielded are valid and the connection stays usable.
 - A transport error or unparseable frame mid-stream raises
-  `OperationalError` / `InterfaceError` and marks the connection broken.
+  `OperationalError` / `InterfaceError` and marks the connection
+  [broken](#broken-connections); so does anything else that interrupts the
+  read or the decoding of a chunk. The stream is over in each case.
 - `close()` is idempotent and is also called by `__del__`, so a stream that
   is simply dropped still follows the drain rule (errors there are swallowed).
+- A stream belongs to the socket it was opened on. Once the connection has
+  closed that socket or re-dialed, iterating past the rows already received
+  raises `OperationalError`, and `close()` reads nothing: what is on the
+  connection now is another statement's.
 - A `CALL` whose body `EMIT`s result sets arrives in one frame: the stream
   starts on the first set and `nextset()` moves `columns` and the iteration
   to the next one, returning `True`, or `None` when there is none (always,
@@ -338,7 +406,10 @@ scopes `read_your_writes` (any hashable; `None` = pool-wide).
 `transaction()` checks out one connection, runs
 [`Connection.transaction`](#transactions) on it — every run a conflict costs
 included — and returns the connection to the pool; `attempts < 1` raises
-`ValueError` before a connection is taken. See [pooling.md](pooling.md).
+`ValueError` before a connection is taken. With `database=`, every
+connection is handed out in that database: one its last borrower left in
+another with a `USE` is put back with one round trip at its next checkout,
+or replaced if that fails. See [pooling.md](pooling.md).
 
 ## `Consistency`
 
@@ -373,8 +444,8 @@ Exception
 | `Error` | base class; catch this for "anything the driver raised" |
 | `InterfaceError` | a truncated or malformed server message, an unknown value/response tag, an unexpected frame during a stream (connection marked broken) |
 | `DatabaseError` | base of the two below |
-| `OperationalError` | no endpoint reachable, authentication denied, mutual-auth signature mismatch, a socket error or read timeout mid-request (connection marked broken), a statement on a broken connection, `rollback()` |
-| `ProgrammingError` | the server rejected the statement (an `Error` frame: bad SQL, constraint violation, unknown table, …), a parameter-count mismatch, an unbindable value type, NaN/Infinity, a non-finite or oversized `Decimal`, non-string document keys, a statement on a closed connection or on a pool that is closed, any statement while a `RowStream` is open |
+| `OperationalError` | no endpoint reachable, authentication denied, mutual-auth signature mismatch, a socket error or read timeout mid-request (connection marked broken), a statement on a broken connection that may not re-dial (`auto_reconnect=False`, or inside `transaction()`), a `RowStream` whose connection was closed or re-dialed, `rollback()` |
+| `ProgrammingError` | the server rejected the statement (an `Error` frame: bad SQL, constraint violation, unknown table, …), a parameter-count mismatch, an unbindable value type, NaN/Infinity, a non-finite or oversized `Decimal`, non-string document keys, a statement on a closed connection or on a pool that is closed, any statement while a `RowStream` is open, `reconnect()` inside `transaction()`, an unknown `auth_mechanism` |
 | `TransactionConflict` | a server error whose message starts with `transaction conflict:` — a `COMMIT` refused because another writer changed a row the transaction writes after its `BEGIN` (standalone server >= 0.346). Nothing was applied, the transaction is over and the connection is back in autocommit, so the transaction can be run again from `BEGIN`. A `ProgrammingError` subclass, raised on every statement path (`execute()`, `executemany()`, `stream()` and its iteration) |
 
 Raised from outside the hierarchy: `ValueError` (bad consistency level,
@@ -382,10 +453,15 @@ Raised from outside the hierarchy: `ValueError` (bad consistency level,
 signed 64-bit integer). Message text from the server is passed through
 unchanged.
 
-A `ProgrammingError` never breaks the connection — a `TransactionConflict`
-included: it is not re-dialed, and a pool neither discards the connection
-nor counts the error against the member. An `OperationalError` from a
-request (as opposed to from `connect()`) always does.
+A statement the server rejected never breaks the connection — a
+`TransactionConflict` included: it is not re-dialed, and a pool neither
+discards the connection nor counts the error against the member. (A
+`ProgrammingError` comes with a broken connection in two cases, neither of
+them a rejected statement: the `USE` of
+[the session database](#the-session-database) refused on a re-dial, and a
+`RowStream` left open by the body of `transaction()`.) An `OperationalError`
+from a request (as opposed to from `connect()`) always does: see
+[broken connections](#broken-connections).
 
 ## Parameters and type mapping
 

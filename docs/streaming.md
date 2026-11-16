@@ -38,12 +38,20 @@ The driver enforces it like this:
    dropping the object — calls `close()`, which **drains** the frames the
    server has already sent so the socket is back at a request boundary.
 4. The drain is capped at **64 frames**. If the stream still has more than
-   that queued, the driver stops reading and **marks the connection broken**:
-   further statements raise `OperationalError`, `is_usable()` stays `False`,
-   and a pool discards it on check-in and dials a replacement. Draining the
-   tail of a small result is far cheaper than a reconnect; draining most of a
-   huge one is not, and a broken-but-honest connection is better than a
-   desynced one whose next caller reads someone else's rows.
+   that queued, the driver stops reading and **marks the connection broken**,
+   closing its socket (which also tells the server to stop sending):
+   `is_usable()` turns `False`, the next statement re-dials — or, with
+   `auto_reconnect=False`, raises `OperationalError` — and a pool discards
+   the connection on check-in and dials a replacement. Draining the tail of
+   a small result is far cheaper than a reconnect; draining most of a huge
+   one is not, and a broken-but-honest connection is better than a desynced
+   one whose next caller reads someone else's rows.
+5. A stream belongs to the socket it was opened on. Once the connection has
+   closed that socket or re-dialed — `conn.close()`, `conn.reconnect()`, the
+   automatic reconnect — the rest of the result is gone: the stream yields
+   the rows it had already received, then raises `OperationalError`, and
+   `close()` reads nothing. It never reads, drains or releases what is on
+   the connection's new socket.
 
 So the rule of thumb: **read to the end when you can; when you cannot, stop
 inside a `with` block and expect the connection to be recycled if a lot was
@@ -89,6 +97,14 @@ works against every server.
   and marks the connection broken.
 - A frame the driver cannot parse raises `InterfaceError` and marks the
   connection broken.
+- Anything else that interrupts the read of a frame or the decoding of a
+  chunk — a `KeyboardInterrupt`, an exception raised by a signal handler —
+  propagates unchanged and marks the connection broken too: part of a frame
+  is still on the socket, or a chunk's rows were dropped.
+
+In each of the last three the socket is closed and the stream is over: a
+further `next()` ends the iteration, it does not resume the result. A stream
+is never retried by the automatic reconnect.
 
 ## Timeouts
 

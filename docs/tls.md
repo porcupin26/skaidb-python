@@ -24,9 +24,10 @@ conn = skaidb.connect(host="db1", tls_ca="/etc/skaidb/ca.crt")
 conn = skaidb.connect(host="db1", tls_insecure=True)
 ```
 
-Setting any of `tls=True`, `tls_ca=...` or `tls_insecure=True` enables TLS.
-`tls_insecure` wins over `tls_ca`. Without any of them the connection is
-plaintext, even if the server would accept TLS.
+Setting any of `tls=True`, `tls_ca=...` or `tls_insecure=True` enables TLS,
+and so does a [client certificate](#client-certificates). `tls_insecure`
+wins over `tls_ca`. Without any of them the connection is plaintext, even if
+the server would accept TLS.
 
 ## The server name
 
@@ -70,7 +71,9 @@ conn = skaidb.connect(host="db1", tls_ca="/etc/skaidb/ca.crt",
 ```
 
 Pass `user` only to assert the expected identity: a certificate mapped to a
-different role fails the connect.
+different role fails the connect. `tls_client_cert` and `tls_client_key` go
+together (`ProgrammingError` when only one is given), and
+`auth_mechanism="certificate"` without TLS fails the connect.
 
 ## Failure modes
 

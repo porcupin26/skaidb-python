@@ -1850,7 +1850,9 @@ def connect(
     ``seeds`` is an optional list of ``"host"`` / ``"host:port"`` endpoints
     tried (in randomized order) until one connects — skaidb is leaderless, so
     any seed serves any request. ``database`` issues ``USE <database>`` as part
-    of connecting, so the session starts in the right database. ``timeout`` is
+    of connecting, so the session starts in the right database; the
+    connection enters its database again on every re-dial — this one, or the
+    one named by the last ``USE`` statement the server accepted. ``timeout`` is
     the default for both dial and reads; ``connect_timeout`` / ``read_timeout``
     override each independently (a read timeout can then sit above the server's
     statement timeout without also slowing dial failures).
@@ -2089,6 +2091,10 @@ class ConnectionPool:
       with the same ``affinity`` key go to the member that took it (the
       coordinator that acknowledged a write reads it back even at ``ONE``).
       0 (default) turns it off.
+    * ``database`` (a :func:`connect` keyword) — every connection is handed
+      out in it: one a borrower left in another database with a ``USE`` is
+      put back at its next checkout. Without it a connection stays in the
+      database its last borrower entered.
 
     Typical use::
 

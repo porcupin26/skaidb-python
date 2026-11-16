@@ -107,15 +107,17 @@ conn = skaidb.connect(seeds=["db1", "db2:7000", "db3"], database="app")
 
 Each seed is `"host"` or `"host:port"` (the port after the last colon wins;
 for an IPv6 literal use `host=`/`port=` instead). `conn.reconnect()` re-dials
-across the same seeds and re-authenticates, discarding the connection's
-prepared statements.
+across the same seeds, re-authenticates and enters the connection's
+[database](#the-session-database) again, discarding its prepared statements.
 
 **Automatic reconnect** (`auto_reconnect=True`, the default). When a node
 goes away (a rolling restart, a crash), the statement whose connection
 failed re-dials and runs once more, trying the OTHER seeds before the one
 that just failed; a connection already broken re-dials before its next
 statement. Prepared statements are re-prepared on the new connection, so
-`executemany` survives a failover too. The retry repeats the whole
+`executemany` survives a failover too, and the new connection enters the
+[database](#the-session-database) the old one was in before anything else
+is sent. The retry repeats the whole
 statement, so one the old node had already applied can run twice
 (at-least-once on failover). Most writes are idempotent — a plain `INSERT`
 replaces the row with the same primary key, and `DELETE` or an `UPDATE` that
@@ -134,6 +136,26 @@ credential: its Common Name is the user (pass `user` only to assert it), and
 no password is sent. The server needs `auth.x509_enabled` and a CA that
 signed the certificate.
 
+### The session database
+
+`database="app"` enters the database as part of connecting. A `USE` sent as
+a statement works too, and replaces it:
+
+```python
+conn = skaidb.connect(host="db1", database="app")
+conn.execute("USE archive")       # the connection is in `archive` from here on
+```
+
+A new session on the server starts in no database, where a bare table name
+resolves in the default one. So the connection remembers the database it is
+in — the one given to `connect()`, then the one named by the last `USE` the
+server accepted — and enters it again on every re-dial, before anything else
+is sent. If the database cannot be entered on the new connection, the
+statement fails with that error; it never runs in another database. A `USE`
+is recognised when it is the whole statement: `USE [DATABASE] name`, the
+name bare or in double quotes (`""` for a quote inside), with an optional
+trailing `;`.
+
 ### Timeouts
 
 `timeout` is the default for both the TCP dial and every read; `connect_timeout`
@@ -147,7 +169,8 @@ conn = skaidb.connect(host="db1", connect_timeout=2, read_timeout=120)
 `timeout=None` disables **both** bounds: a dial to a black-holed address and a
 read from a live-but-silent peer will block forever. That includes the drain
 an abandoned stream performs on `close()` (see [streaming](#streaming-large-results)).
-A read timeout surfaces as `OperationalError` and marks the connection broken.
+A read timeout surfaces as `OperationalError` and marks the connection
+broken, which closes its socket at once (see [health checks](#health-checks)).
 
 ### TLS
 
@@ -159,8 +182,10 @@ conn = skaidb.connect(host="db1", tls_insecure=True)            # dev only: no v
 
 Any of the three enables TLS. The server name presented as SNI and checked
 against the certificate is `tls_server_name` (default `"skaidb"`, the SAN the
-server's certificate carries). SCRAM runs inside the TLS session. The driver
-does not present a client certificate. Details: [docs/tls.md](https://github.com/porcupin26/skaidb-python/blob/main/docs/tls.md).
+server's certificate carries). SCRAM runs inside the TLS session.
+`tls_client_cert` / `tls_client_key` (PEM files) present a client
+certificate — for a server that verifies its clients, and for the
+certificate login above — and enable TLS as well. Details: [docs/tls.md](https://github.com/porcupin26/skaidb-python/blob/main/docs/tls.md).
 
 ### Consistency
 
@@ -183,12 +208,22 @@ DDL is always run at quorum by the server regardless of this setting.
 - `conn.is_usable()` — no round-trip. `True` unless the connection is closed,
   was left out of sync by a transport error or an undrainable abandoned
   stream, or is currently mid-stream.
-- `conn.ping()` — a real round-trip (`SHOW DATABASES`); `False` marks it broken.
-- `conn.reconnect()` — re-dial (failing over across seeds) and re-authenticate.
+- `conn.ping()` — a real round-trip (`SHOW DATABASES`); `False` when it
+  fails (a transport failure also marks the connection broken).
+- `conn.reconnect()` — re-dial (failing over across seeds), re-authenticate
+  and enter the database again.
 - `conn.closed` — `True` after `close()`.
 
-A broken connection refuses further statements with `OperationalError` rather
-than retrying, because its socket may still hold someone else's unread frames.
+A connection is marked **broken** when its socket is dead or out of step with
+the server: a transport error or a read timeout, an abandoned stream too long
+to drain, a re-dial that did not finish, or a statement stopped between its
+request and its reply by anything else — a `KeyboardInterrupt`, an exception
+raised by a signal handler — which propagates unchanged. The socket is closed
+at that moment, not at the next statement: replies carry no request id, so
+one left unread would answer the next statement, and until the socket closes
+the server keeps the session and any transaction open in it. With
+`auto_reconnect` the next statement re-dials first; without it, statements
+raise `OperationalError` until `reconnect()`.
 
 ## Statements and parameters
 
@@ -214,7 +249,10 @@ cur.execute("SELECT id FROM users WHERE id IN (?)", ([1, 2, 3],))   # set member
 
 Prepared statements are cached per connection (up to 240 entries, under the
 server's 256-per-connection limit) and reused; past the cap a statement is
-prepared, executed and closed in one go. The cache is dropped on `reconnect()`.
+prepared, executed and closed again, so the server's table never fills. A
+prepared statement belongs to the connection that prepared it: the cache is
+dropped with the socket, and after a re-dial a statement is prepared again
+before it runs.
 
 Statement kinds the server refuses to prepare (DDL and session control such
 as `USE`) fall back to **client-side text binding** for scalar parameters: a
@@ -261,8 +299,9 @@ print(cur.rowcount)   # total rows affected
 ```
 
 The statement is prepared once and **every parameter row ships in a single
-frame** (`ExecuteBatch`). Each row autocommits on its own; on a failure the
-`ProgrammingError` names the row index and earlier rows stay applied. Servers
+frame** (`ExecuteBatch`). Outside a transaction each row commits on its own:
+on a failure the `ProgrammingError` names the row index and earlier rows stay
+applied. Servers
 without the batch opcode, and statements that cannot be prepared, fall back to
 a per-row loop automatically.
 
@@ -314,11 +353,14 @@ reaching the end, by `close()`, or by being garbage-collected). `close()`
 drains the frames the server has already queued so the socket is left at a
 request boundary — but only up to **64 frames**. Past that, the remainder is
 big enough that draining costs more than a reconnect, so the connection is
-**marked broken** instead: `is_usable()` turns `False`, further statements
-raise `OperationalError`, and a pool discards it rather than handing on a
-socket with rows still queued. Rule of thumb: iterate to the end, or stop
-early inside a `with` block and expect the connection to be recycled if a lot
-was still in flight. Details: [docs/streaming.md](https://github.com/porcupin26/skaidb-python/blob/main/docs/streaming.md).
+**marked broken** instead and its socket closed: `is_usable()` turns `False`,
+the next statement re-dials (without `auto_reconnect` it raises
+`OperationalError`), and a pool discards the connection. Rule of thumb:
+iterate to the end, or stop early inside a `with` block and expect the
+connection to be recycled if a lot was still in flight. A stream belongs to
+the socket it was opened on: once the connection has been closed or re-dialed
+it raises `OperationalError` after the rows it had already received, and
+closing it reads nothing. Details: [docs/streaming.md](https://github.com/porcupin26/skaidb-python/blob/main/docs/streaming.md).
 
 ## Connection pool
 
@@ -342,7 +384,9 @@ and `read_your_writes=<seconds>` with `pool.connection(affinity=key)`;
 blocks — when no idle connection is available a new one is dialed, and a
 returned connection beyond `maxsize` is closed. Connections are validated with
 `is_usable()` on checkout and check-in, so one broken by a transport error or
-an undrained stream is closed and replaced transparently. Details:
+an undrained stream is closed and replaced transparently. A pool made with
+`database=` hands every connection out in that database, also one its last
+borrower left in another with a `USE`. Details:
 [docs/pooling.md](https://github.com/porcupin26/skaidb-python/blob/main/docs/pooling.md).
 
 ## Streams (`CREATE STREAM`)
@@ -391,6 +435,10 @@ balance = conn.transaction(move)          # BEGIN, move(conn), COMMIT
 - `begin` is the opening statement, sent verbatim: plain `BEGIN` on a
   standalone server, `BEGIN ATOMIC` or `BEGIN ATOMIC PARTITION (col = lit)`
   on a cluster.
+- Finish or close any stream the body opens before it returns. With one
+  still open neither `COMMIT` nor `ROLLBACK` can be sent: the call raises,
+  and the connection's socket is closed, which is what ends the transaction
+  on the server.
 
 `pool.transaction(body, attempts=3, begin="BEGIN")` does the same from a
 [pool](#connection-pool): it checks out one connection for the whole
@@ -432,7 +480,9 @@ Two rules hold for both forms:
   block) and use only the connection you were given. The automatic reconnect
   would break this rule — a statement retried on a fresh connection runs
   outside the transaction — so `transaction()` switches it off from the
-  answer to `BEGIN` until its transaction has ended; for a hand-written
+  answer to `BEGIN` until its transaction has ended, and refuses
+  `conn.reconnect()` in the body (`ProgrammingError`): a lost connection ends
+  the transaction, and the caller runs it again. For a hand-written
   transaction, connect with `auto_reconnect=False`.
 - **Stop if `BEGIN` fails.** When the opening statement raises, no
   transaction is open and every statement after it would commit on its own.
@@ -453,7 +503,8 @@ Exception
     └── skaidb.DatabaseError
         ├── skaidb.OperationalError  # dial/auth/transport failures, broken connection, rollback()
         └── skaidb.ProgrammingError  # the server rejected the statement; bad parameters;
-            │                        # closed connection; statement while streaming
+            │                        # closed connection; statement while streaming;
+            │                        # reconnect() inside transaction()
             └── skaidb.TransactionConflict  # the server refused a COMMIT: another
                                             # writer changed a row the transaction writes
 ```
@@ -461,9 +512,14 @@ Exception
 - A server `Error` frame is a **statement** error (`ProgrammingError`); the
   connection stays usable. One whose message starts with `transaction
   conflict:` is a `TransactionConflict` (see [transactions](#transactions)).
-- A transport failure (`OperationalError`) marks the connection broken. With
-  `auto_reconnect` (the default) the failed statement re-dials and retries
-  once; otherwise call `reconnect()` or let the pool replace it.
+- A transport failure (`OperationalError`) marks the connection broken and
+  closes its socket. With `auto_reconnect` (the default) the failed statement
+  re-dials and retries once; otherwise call `reconnect()` or let the pool
+  replace it.
+- Anything else that stops a statement between its request and its reply —
+  a `KeyboardInterrupt`, a `SystemExit`, an exception raised by a signal
+  handler — propagates unchanged and costs the connection in the same way:
+  its reply is never read as the answer to a later statement.
 - Outside the hierarchy: `ValueError` for an invalid consistency level,
   `maxsize < 1` or `attempts < 1`, and `struct.error` for an `int` beyond
   64 bits.
@@ -492,8 +548,9 @@ which is what a [pool](#connection-pool) gives you.
 ## Examples
 
 [`examples/`](https://github.com/porcupin26/skaidb-python/tree/main/examples) contains runnable scripts: `basic.py`, `streaming.py`,
-`pool.py`, `tls.py`, `subscribe.py`. Each takes the host/port/user/password on
-the command line and defaults to `localhost:7000`.
+`pool.py`, `tls.py`, `subscribe.py`. Each names its arguments in its
+docstring; `basic.py` and `streaming.py` take `[host] [port] [user] [password]`
+and default to `localhost:7000`.
 
 ```sh
 python3 examples/basic.py localhost 7000 skaidb secret
