@@ -9,6 +9,7 @@ socket it was opened on.
 Against the fake server of `test_transactions`, over real sockets.
 """
 
+import gc
 import signal
 import struct
 import threading
@@ -567,7 +568,8 @@ class StaleStream(_Case):
     def test_dropping_it_is_harmless(self):
         old = self.stale_stream()
         new = self.conn.stream(NAMES)
-        del old  # no close(): the refcount drop runs __del__
+        del old  # no close(): dropping the last reference runs __del__ …
+        gc.collect()  # … at once on CPython, here on an interpreter without refcounts
         self.assertEqual(list(new), [("ada",), ("bob",)])
         self.assertTrue(self.conn.is_usable())
 

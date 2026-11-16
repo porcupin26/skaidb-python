@@ -10,6 +10,7 @@ stream, and a client that abandons one early must drain the remaining frames
 or stop using the connection.
 """
 
+import gc
 import struct
 import threading
 import unittest
@@ -215,7 +216,8 @@ class Streaming(unittest.TestCase):
         )
         rows = conn.stream("SELECT id FROM big")
         next(iter(rows))
-        del rows  # no close(), no context manager: refcount drop only
+        del rows  # no close(), no context manager: only the last reference dropped
+        gc.collect()  # at once on CPython; an interpreter without refcounts collects here
         self.assertEqual(conn.unread, 0)
         self.assertFalse(conn._streaming)
         self.assertTrue(conn.is_usable())
