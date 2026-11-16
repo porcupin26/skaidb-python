@@ -402,7 +402,7 @@ class Pooled(_Case):
         pool = self.pool(database="app")
         with pool.connection() as conn:
             conn.execute("USE archive")
-        self.server.on('USE "app"', GONE)  # refuses the reset of connection 1
+            self.server.on('USE "app"', GONE)  # refuses the reset of connection 1
         with pool.connection() as conn:
             conn.execute(COUNT)
         self.assertEqual(self.server.ran_in[-1], ("app", COUNT))
@@ -410,20 +410,26 @@ class Pooled(_Case):
         self.assertTrue(self.server.hung_up(1), "the connection left outside it was closed")
         self.assertEqual(pool.members()[0]["idle"], 1)
 
-    def test_a_pool_without_a_database_leaves_a_borrowers_use_in_place(self):
-        # No database of its own to restore: the connection stays where its
-        # last borrower took it (enter the database on every checkout, or
-        # give the pool one).
+    def test_a_pool_without_a_database_hands_every_borrower_the_default_one(self):
+        # Its connections' home is `default`, where every new connection
+        # starts: a borrower's USE does not outlive its checkout.
         pool = self.pool()
         with pool.connection() as conn:
             conn.execute("USE archive")
-        with pool.connection() as conn:
             conn.execute(COUNT)
             self.assertEqual(self.server.ran_in[-1], ("archive", COUNT))
+        with pool.connection() as conn:
+            conn.execute(COUNT)
             self.assertEqual(
-                self.lose_the_connection_then_read_and_write(conn), ["archive", "archive"]
+                self.server.ran_in[-1], ("default", COUNT), "the last borrower's USE leaked"
             )
-        self.assertNotIn('USE "app"', self.server.statements)
+            # … before a re-dial and after it alike (a new session is in
+            # the default database without being told).
+            self.assertEqual(
+                self.lose_the_connection_then_read_and_write(conn), [None, None]
+            )
+        self.assertEqual(self.server.statements.count('USE "default"'), 1)
+        self.assertNotIn("archive", [db for db, sql in self.server.ran_in[-2:]])
 
 
 if __name__ == "__main__":

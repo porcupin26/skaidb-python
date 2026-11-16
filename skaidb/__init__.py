@@ -2519,10 +2519,12 @@ class ConnectionPool:
       with the same ``affinity`` key go to the member that took it (the
       coordinator that acknowledged a write reads it back even at ``ONE``).
       0 (default) turns it off.
-    * ``database`` (a :func:`connect` keyword) — every connection is handed
-      out in it: one a borrower left in another database with a ``USE`` is
-      put back at its next checkout. Without it a connection stays in the
-      database its last borrower entered.
+    * Every borrower gets a connection in the pool's own session state: in
+      the pool's database — ``database`` (a :func:`connect` keyword), or
+      ``default`` without it — with no consistency override, no scan budget
+      and no transaction open. What a borrower changed with ``USE``, ``SET
+      CONSISTENCY``, ``SET SCAN BUDGET`` or ``BEGIN`` is put back when its
+      connection comes back, or the connection is closed.
 
     Typical use::
 
@@ -2610,8 +2612,6 @@ class ConnectionPool:
             elif not conn.is_usable():
                 conn.close()  # discard a stale idle connection, then loop
                 continue
-            elif not self._in_pool_database(conn):
-                continue
             with self._lock:
                 m = self._members.get(conn._pool_ep)
                 if m is not None:
@@ -2620,29 +2620,54 @@ class ConnectionPool:
             conn._pool_out = True
             return conn
 
-    def _in_pool_database(self, conn: Connection) -> bool:
-        """Put an idle connection back in the pool's database when its last
-        borrower left it in another one with a ``USE`` — one round trip,
-        only then. False, with the connection closed, when that fails: it
-        must not go out in a database the next borrower did not ask for. A
-        pool made without ``database=`` has none to restore, and its
-        connections stay where a borrower took them."""
-        database = self._kwargs.get("database")
-        if database is None or conn._database == database:
-            return True
+    def _home(self, conn: Connection) -> bool:
+        """Put a connection that comes back into the pool's own session
+        state, so the next borrower gets it as a new connection would be:
+        in the pool's database (its ``database=``, or ``default``, where
+        every session starts), under no consistency override and no scan
+        budget, with no transaction open. Only what the connection's notes
+        say its borrower changed is sent — ``ROLLBACK`` first, then ``USE``,
+        ``SET SCAN BUDGET DEFAULT``, ``SET CONSISTENCY DEFAULT`` — so a
+        borrower that changed nothing costs no round trip. The notes go
+        with it: a re-dial for the next borrower restores the pool's state,
+        not the last borrower's.
+
+        False when a statement fails — a server before 0.349 refuses ``SET
+        CONSISTENCY DEFAULT``, or the connection is gone: the caller closes
+        the connection instead of pooling it. Nothing dials here."""
+        home = self._kwargs.get("database")
         try:
-            conn._use_database(database)
+            if conn._txn_noted:
+                conn._query("ROLLBACK", conn._consistency)
+            if (conn._database or "default") != (home or "default"):
+                conn._use_database(home or "default")
+            conn._database = home
+            if conn._session_scan_budget is not None:
+                conn._query("SET SCAN BUDGET DEFAULT", conn._consistency)
+            if conn._session_consistency is not None:
+                conn._query("SET CONSISTENCY DEFAULT", conn._consistency)
         except Error:
-            conn.close()
             return False
         return True
 
     def putconn(self, conn: Connection) -> None:
-        """Return a connection to the pool, or close it if it is broken, its
-        member is ejected or gone, or the pool is full."""
-        # Asked before the pool's lock is taken: the answer looks at the
-        # socket, and a connection found dead reports to the pool.
-        usable = conn.is_usable()
+        """Return a connection to the pool — in the pool's own session
+        state, whatever its borrower did to it (`_home`) — or close it if
+        it is broken, cannot be put back in that state, its member is
+        ejected or gone, or the pool is full."""
+        # Decided before the pool's lock is taken: the answer looks at the
+        # socket, a connection found dead reports to the pool, and putting
+        # the session back may cost round trips.
+        try:
+            usable = not self.closed and conn.is_usable() and self._home(conn)
+        except BaseException:
+            # Interrupted half way: the connection is not pooled, and is
+            # no longer counted as checked out.
+            self._put(conn, False)
+            raise
+        self._put(conn, usable)
+
+    def _put(self, conn: Connection, usable: bool) -> None:
         with self._lock:
             m = self._members.get(conn._pool_ep)
             if getattr(conn, "_pool_out", False):

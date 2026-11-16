@@ -208,6 +208,13 @@ class Endpoints(unittest.TestCase):
 class _FakeConn:
     """Stand-in connection for pool tests: no socket, controllable health."""
 
+    # The session state the pool reads when a connection comes back: that
+    # of a connection whose borrower changed nothing.
+    _database = None
+    _session_consistency = None
+    _session_scan_budget = None
+    _txn_noted = False
+
     def __init__(self, endpoint):
         self.closed = False
         self.broken = False
