@@ -4,6 +4,135 @@ All notable changes to the skaidb Python driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.5.2] - 2026-11-16
+
+### Fixed
+- **A transaction begun with a `BEGIN` statement is no longer carried onto a
+  new connection.** Only `conn.transaction()` kept the automatic reconnect
+  away from its transaction. After `conn.execute("BEGIN")`, a lost
+  connection was replaced like any other: the rest of the transaction ran on
+  a new session, each statement committing on its own, and the `COMMIT` was
+  answered `no transaction in progress` — half a transaction applied. The
+  connection now notes a transaction, from a `BEGIN` the server accepted
+  (`BEGIN`, `BEGIN TRANSACTION`, `BEGIN ATOMIC …`) until `COMMIT` or
+  `ROLLBACK` is answered, and does not re-dial while one is open. When the
+  connection is lost, the statement under which it is lost raises
+  `OperationalError`, and so does every later one, without being sent. The
+  application ends the transaction where it is: `ROLLBACK` succeeds without
+  being sent — the server discarded the transaction with the connection —
+  and `COMMIT` raises an `OperationalError` that says nothing was committed.
+  A connection lost under the `COMMIT` itself is an unknown outcome, and
+  that error says so instead. After either, the next statement re-dials as
+  usual.
+- **`conn.commit()` and `conn.rollback()` end the transaction a `BEGIN`
+  statement opened.** Both sent nothing: after `conn.execute("BEGIN")`,
+  `conn.commit()` returned without an error and the transaction stayed open
+  — no other connection ever saw its rows, and they were gone when the
+  connection closed. With a transaction open they now send `COMMIT` /
+  `ROLLBACK` and raise what the statement raises; with none open they are
+  accepted and send nothing, so calling them as a matter of routine costs no
+  round trip.
+- **`SET CONSISTENCY` and `SET SCAN BUDGET` survive a re-dial.** Like the
+  session database, they live on the connection, and a new connection has
+  neither: after `SET SCAN BUDGET ROWS 1` a scan was refused, the member
+  restarted while the client was idle, and the same scan ran — the limit
+  silently gone; after `SET CONSISTENCY ALL` the statements read at the
+  request's own level. The connection now notes the last of each the server
+  accepted (one statement, any letter case, an optional `;`, `--` comments
+  skipped) and sends it again on every later dial, after the database and
+  before the statement; `… DEFAULT` clears the note. A setting refused on
+  the new connection fails the statement with that error: nothing runs
+  under other settings than the application set.
+- **A `USE` is not held hostage by the database it leaves.** The connection
+  re-entered its noted database on every re-dial — also when the statement
+  that re-dialed was itself a `USE`. Once that database had been dropped,
+  every statement failed at the re-dial (rightly: it must not run
+  elsewhere), `USE other` included, and the only way out was a new
+  connection. A re-dial made for a `USE` now sends the noted settings and
+  then the `USE`, whose answer decides the session database; the same for a
+  `SET` and the setting it replaces. If that statement is refused, the
+  connection is marked broken rather than left in the default database.
+- **A connection the server closed while it was idle costs no statement.** A
+  member's restart, a failover or an idle timeout closes idle connections.
+  Over a real network the next write to such a socket still succeeds and
+  only the read fails, after the statement left: a stream raised
+  `OperationalError`, a statement under `auto_reconnect=False` failed
+  although nothing was wrong with it, a retried write could run twice, and
+  a frame nobody asked for on the idle socket was read as the next
+  statement's reply. Before a statement's first request the driver now
+  looks at the socket — a readiness poll that does not wait, no round trip;
+  under TLS the transport's socket — and replaces a connection that is
+  closed, reset or holds stray bytes before anything is written to it.
+  `is_usable()` takes the same look, so a pool no longer hands out a
+  connection its member closed: the checkout gives a working one, with or
+  without `auto_reconnect`. Inside a transaction the loss is reported, as
+  above.
+- **A dial whose `Hello` is not answered fails, and the next endpoint is
+  tried.** A transport failure under the `Hello` was ignored, and
+  `connect()` returned the connection as usable. With the reply late or
+  missing past the read timeout, the first statement was written and then
+  failed on the read: under `auto_reconnect` it was sent again elsewhere —
+  an `UPDATE … SET n = n + 1` reached two members — and without it the
+  caller got an error for a statement the member had received. The same
+  now holds for the `USE` and the settings that put a session back: a
+  member lost under them is one more endpoint that did not work, not the
+  end of the dial. (What a server answers is unchanged: an old server's
+  error to `Hello` is ignored, and a database that does not exist ends the
+  dial.)
+- **A transaction conflict in a batch row is a `TransactionConflict`.** The
+  error of an `executemany` batch starts with the failing row's name —
+  `batch row 1: <error> (1 rows applied before it)` — so a conflict there
+  did not match the `transaction conflict:` prefix and stayed a plain
+  `ProgrammingError`. The row's own error is now what is read; the message
+  is unchanged.
+
+### Changed
+- **A pool hands every borrower a connection in the pool's own session
+  state:** in the pool's database (`database=`, or `default` without it),
+  with no consistency override, no scan budget and no transaction open.
+  Before, a borrower's `SET CONSISTENCY` and `SET SCAN BUDGET` stayed on
+  the connection for the next borrower — which read at another consistency,
+  or was refused under a scan limit it never set — and so did a transaction
+  left open. What a borrower changed is put back when its connection comes
+  back (`ROLLBACK`, `USE`, `SET SCAN BUDGET DEFAULT`, `SET CONSISTENCY
+  DEFAULT` — only the ones needed; a borrower that changed nothing costs no
+  round trip), and a connection that cannot be put back is closed instead
+  of pooled. **Upgrade note:** on a pool without `database=`, a borrower's
+  `USE` no longer carries over to later borrowers — every checkout starts
+  in `default`. Give the pool its `database=`, or send `USE` at the start
+  of each checkout. `SET CONSISTENCY DEFAULT` needs server 0.349: on an
+  older server a connection whose borrower set a consistency is closed when
+  it comes back, and the next borrower gets a new one.
+- `conn.rollback()` no longer raises when no transaction is open: there is
+  nothing to roll back, and the server answers a `ROLLBACK` with nothing
+  open the same way. (It raised `OperationalError` in every state, also as
+  the clean-up after a failed `commit()`, where it replaced the error the
+  caller had to see.) Inside `transaction()` it still raises, and
+  `commit()` still sends nothing there: the helper ends its transaction.
+- `conn.reconnect()` raises `ProgrammingError` in the middle of a
+  transaction begun with a `BEGIN` statement, as it does inside
+  `transaction()`: end the transaction first. Once the connection is lost
+  it is accepted, and ends the lost transaction as it dials — run the
+  transaction again from `BEGIN`.
+- When the body of `transaction()` swallows the loss of its connection and
+  returns, the error of the helper's unsent `COMMIT` now says that nothing
+  was committed.
+
+### Documentation
+- The failure table of `docs/tls.md` was checked against servers serving
+  TLS, and three of its four rows corrected: TLS dialed to a plaintext port
+  is `EOF occurred in violation of protocol`, not `WRONG_VERSION_NUMBER`
+  (which is TLS dialed to a plaintext REST port); plaintext dialed to a
+  server that requires TLS is `Connection reset by peer`; `bad handshake
+  challenge` is neither of the causes it was given. The refusals of the
+  certificate login are listed.
+- "Session state" (README, `docs/api.md`) and "Session state and the pool"
+  (`docs/pooling.md`) replace the sections on the session database;
+  transactions written by hand, `commit()` / `rollback()` and the look at
+  an idle socket are described.
+- A `RowStream` that is just dropped is closed when the interpreter
+  collects it — at once on CPython, later on PyPy (`docs/streaming.md`).
+
 ## [1.5.1] - 2026-11-16
 
 ### Fixed
