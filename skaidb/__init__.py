@@ -636,6 +636,11 @@ class Connection:
     _database = None
     _session_consistency = None
     _session_scan_budget = None
+    # The part of the session's state the statement being run sets itself
+    # (`_stating`), and whether a dial made for it left that part out
+    # (`_restore_session`).
+    _stating = None
+    _unrestored = False
     # The pool that owns this connection (see `ConnectionPool`): told each
     # round trip's latency, each transport failure and each write, and asked
     # for the dial order when the connection re-dials. None outside a pool.
@@ -824,11 +829,29 @@ class Connection:
         `SET CONSISTENCY`, then the noted `SET SCAN BUDGET` — each only if
         there is one. A statement the server refuses here is raised, and
         the dial has not finished (`_open`): no statement runs in another
-        database, or under other settings, than the application set."""
+        database, or under other settings, than the application set.
+
+        Except the part the statement this dial is made for sets itself
+        (`_stating`): a `USE` does not first enter the database it leaves.
+        That database may be gone — dropped while the connection was down —
+        and then no statement could ever run again, the `USE` that leaves
+        it included. The statement's own answer decides that part; until
+        it has, the session is short of it (`_unrestored`)."""
+        self._unrestored = False
         if self._database is not None:
-            self._use_database(self._database)
-        for setting in (self._session_consistency, self._session_scan_budget):
-            if setting is not None:
+            if self._stating == "use":
+                self._unrestored = True
+            else:
+                self._use_database(self._database)
+        for kind, setting in (
+            ("consistency", self._session_consistency),
+            ("scan_budget", self._session_scan_budget),
+        ):
+            if setting is None:
+                continue
+            if self._stating == kind:
+                self._unrestored = True
+            else:
                 self._query(setting, self._consistency)
 
     def _use_database(self, db: str) -> None:
@@ -915,9 +938,36 @@ class Connection:
             raise OperationalError("connection closed by server")
         return buf
 
-    def _run(self, fn):
-        """Run one statement; if its connection fails in transit, re-dial
-        (walking the other endpoints first) and run it once more.
+    @contextmanager
+    def _statement(self, sql: str):
+        """The span of one statement of the application, from before its
+        first request to its answer.
+
+        A statement that sets part of the session's state itself — a `USE`,
+        a `SET CONSISTENCY`, a `SET SCAN BUDGET` — says so for the dials
+        made on its behalf, which then leave that part alone
+        (`_restore_session`). If such a dial happened and the statement
+        was not answered with success, the new session has neither the old
+        state nor a new one: the connection is marked broken, so the next
+        statement dials again and puts all of it back — or fails with the
+        error of what cannot be put back. It never runs outside the
+        database, or the settings, the driver has noted."""
+        noted = _session_statement(sql)
+        outer, self._stating = self._stating, noted[0] if noted else None
+        try:
+            yield
+        except BaseException:
+            if self._unrestored:
+                self._mark_broken()
+            raise
+        finally:
+            self._stating = outer
+            self._unrestored = False
+
+    def _run(self, sql, fn):
+        """Run the statement `sql`, which `fn` sends; if its connection
+        fails in transit, re-dial (walking the other endpoints first) and
+        run it once more.
 
         The retry repeats the WHOLE statement — prepare included, since
         prepared ids die with the connection — and happens at most once. A
@@ -930,18 +980,19 @@ class Connection:
         Inside :meth:`transaction` the failure always surfaces: on a fresh
         connection the statement would run outside the transaction and
         commit on its own."""
-        try:
-            return fn()
-        except OperationalError:
-            if (
-                not (self._auto_reconnect and self._broken)
-                or self.closed
-                or self._streaming
-                or self._txn_open
-            ):
-                raise
-            self.reconnect()
-            return fn()
+        with self._statement(sql):
+            try:
+                return fn()
+            except OperationalError:
+                if (
+                    not (self._auto_reconnect and self._broken)
+                    or self.closed
+                    or self._streaming
+                    or self._txn_open
+                ):
+                    raise
+                self.reconnect()
+                return fn()
 
     # -- handshake --
     def _handshake_certificate(self, user: str) -> None:
@@ -1291,6 +1342,12 @@ class Connection:
             req = bytes(req)
         else:
             req = bytes([_OP_QUERY_STREAM, level]) + struct.pack("<I", len(body)) + body
+        with self._statement(sql):
+            return self._stream(sql, req, bool(params))
+
+    def _stream(self, sql: str, req: bytes, parameterised: bool) -> "RowStream":
+        """Send the stream request `req` for `sql` and make the
+        :class:`RowStream` of its reply (see `stream`)."""
         r = self._stream_open(req)
         # Only a RowsHeader has more frames behind it; until the first frame
         # turns out to be the whole reply, the rest is still on the socket.
@@ -1302,7 +1359,7 @@ class Connection:
             if tag == _RESP_ERROR:
                 msg = r.text()
                 if "unknown opcode" in msg:
-                    what = "parameterised streaming (skaidb >= 0.330)" if params else "streaming"
+                    what = "parameterised streaming (skaidb >= 0.330)" if parameterised else "streaming"
                     raise ProgrammingError(f"server does not support {what}: {msg}")
                 raise _server_error(msg)
             if tag in (_RESP_MUTATION, _RESP_DDL):
@@ -1791,12 +1848,12 @@ class Cursor:
             # no SQL literal form. Falls back to text interpolation for
             # statement kinds the server won't prepare.
             kind, a, b = conn._run(
-                lambda: conn._execute_params(sql, params, self._consistency)
+                sql, lambda: conn._execute_params(sql, params, self._consistency)
             )
         else:
             # No parameters: one-shot query. `_bind` still rejects a stray `?`.
             text = _bind(sql, None)
-            kind, a, b = conn._run(lambda: conn._query(text, self._consistency))
+            kind, a, b = conn._run(sql, lambda: conn._query(text, self._consistency))
         conn._note_statement(sql)
         self._result_sets = []
         if kind == "sets":
@@ -1822,7 +1879,7 @@ class Cursor:
         if not rows:
             self.rowcount = 0
             return
-        self.connection._run(lambda: self._executemany_once(sql, rows))
+        self.connection._run(sql, lambda: self._executemany_once(sql, rows))
         self.connection._note_statement(sql)
 
     def _executemany_once(self, sql: str, rows: "list[list[Any]]") -> None:

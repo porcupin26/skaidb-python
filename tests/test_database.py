@@ -17,10 +17,10 @@ import skaidb
 
 try:
     from test_stream import _f_error
-    from test_transactions import Server, _credentials
+    from test_transactions import DROP, Server, _credentials
 except ImportError:  # run as `python -m unittest tests.test_database`
     from tests.test_stream import _f_error
-    from tests.test_transactions import Server, _credentials
+    from tests.test_transactions import DROP, Server, _credentials
 
 COUNT = "SELECT count(*) FROM notes"
 INSERT = "INSERT INTO notes (id, body) VALUES (?, ?)"
@@ -209,6 +209,151 @@ class AfterARedial(_Case):
         self.assertEqual(self.server.connections, 1)
         conn.execute(COUNT)
         self.assertEqual(self.server.ran_in[-1], ("app", COUNT))
+
+
+class LeavingADatabase(_Case):
+    """A `USE` is never held hostage by the database it leaves. The noted
+    database may be gone by the time the connection is re-dialed — dropped
+    from another connection — and every statement then fails at the re-dial
+    (it must not run elsewhere). So must not the `USE` that leaves it: the
+    dial made for a `USE` does not first enter the old database."""
+
+    def gone(self, conn):
+        """`conn` is in `app`; `app` is dropped; the connection is lost."""
+        conn.execute("USE app")
+        self.server.always('USE "app"', GONE)
+        self.server.restart()
+
+    def test_a_use_gets_out_of_a_database_that_was_dropped(self):
+        ways = [
+            ("execute", lambda conn: conn.execute("USE other")),
+            ("a stream", lambda conn: conn.stream("use other; -- the new one").close()),
+        ]
+        for name, use in ways:
+            with self.subTest(name):
+                self.server = Server()
+                self.addCleanup(self.server.close)
+                conn = self.connect()
+                self.gone(conn)
+                # Any other statement fails with the error of the USE, and
+                # runs nowhere.
+                before = len(self.server.ran_in)
+                for _ in range(2):
+                    with self.assertRaises(skaidb.ProgrammingError) as cm:
+                        conn.execute("SELECT 1")
+                    self.assertEqual(str(cm.exception), 'database "app" does not exist')
+                self.assertNotIn("SELECT 1", [sql for _, sql in self.server.ran_in[before:]])
+                # The USE of another database is sent without entering `app`.
+                dialed = self.server.connections
+                use(conn)
+                self.assertEqual(self.server.connections, dialed + 1)
+                on_it = [sql for n, sql in self.server.log if n == self.server.connections]
+                self.assertEqual(len(on_it), 1, on_it)
+                # Its answer decides the session database, as always.
+                conn.execute(COUNT)
+                self.assertEqual(self.server.ran_in[-1], ("other", COUNT))
+                self.assertEqual(self.lose_the_connection_then_read_and_write(conn), ["other", "other"])
+
+    def test_the_noted_settings_are_sent_before_that_use(self):
+        conn = self.connect()
+        conn.execute("SET CONSISTENCY ALL")
+        conn.execute("SET SCAN BUDGET ROWS 1")
+        self.gone(conn)
+        conn.execute("USE other")
+        on_it = [sql for n, sql in self.server.log if n == self.server.connections]
+        self.assertEqual(on_it, ["SET CONSISTENCY ALL", "SET SCAN BUDGET ROWS 1", "USE other"])
+        conn.execute(COUNT)
+        self.assertEqual(self.server.ran_in[-1], ("other", COUNT))
+        self.assertEqual(self.server.ran_under[-1], ("ALL", "ROWS 1", COUNT))
+
+    def test_a_use_that_is_refused_leaves_no_statement_outside_the_database(self):
+        # The new session entered neither `app` nor `nosuch`: it is in the
+        # default database, and must carry nothing.
+        conn = self.connect()
+        self.gone(conn)
+        self.server.on("USE nosuch", _f_error('database "nosuch" does not exist'))
+        with self.assertRaises(skaidb.ProgrammingError) as cm:
+            conn.execute("USE nosuch")
+        self.assertIn('"nosuch"', str(cm.exception))
+        self.assertFalse(conn.is_usable(), "left open in the default database")
+        self.assertTrue(self.server.hung_up(self.server.connections))
+        before = len(self.server.ran_in)
+        with self.assertRaises(skaidb.ProgrammingError) as cm:
+            conn.execute(COUNT)
+        self.assertEqual(str(cm.exception), 'database "app" does not exist')
+        self.assertNotIn(COUNT, [sql for _, sql in self.server.ran_in[before:]])
+        # `app` is the session database until a USE succeeds.
+        conn.execute("USE other")
+        conn.execute(COUNT)
+        self.assertEqual(self.server.ran_in[-1], ("other", COUNT))
+
+    def test_a_use_interrupted_after_that_dial_costs_the_connection(self):
+        conn = self.connect()
+        self.gone(conn)
+        stop = KeyboardInterrupt()
+        real = skaidb.Connection._parse_result
+
+        def parse(r):
+            raise stop
+
+        skaidb.Connection._parse_result = staticmethod(parse)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                conn.execute("USE other")
+        finally:
+            skaidb.Connection._parse_result = staticmethod(real)
+        # The server entered `other`; the driver does not know it did.
+        self.assertFalse(conn.is_usable())
+        conn.execute("USE other")
+        conn.execute(COUNT)
+        self.assertEqual(self.server.ran_in[-1], ("other", COUNT))
+
+    def test_a_use_on_a_healthy_connection_is_one_statement(self):
+        conn = self.connect()
+        conn.execute("USE app")
+        self.server.on("USE nosuch", _f_error('database "nosuch" does not exist'))
+        with self.assertRaises(skaidb.ProgrammingError):
+            conn.execute("USE nosuch")
+        # Refused on the session it was sent to, which is still in `app`.
+        self.assertTrue(conn.is_usable())
+        conn.execute(COUNT)
+        self.assertEqual(self.server.ran_in[-1], ("app", COUNT))
+        self.assertEqual(self.server.connections, 1)
+
+    def test_a_use_whose_connection_fails_in_transit_does_not_enter_the_old_one_either(self):
+        conn = self.connect()
+        conn.execute("USE app")
+        self.server.always('USE "app"', GONE)
+        self.server.on("USE other", DROP)
+        conn.execute("USE other")
+        self.assertEqual(self.server.log[-2:], [(1, "USE other"), (2, "USE other")])
+        conn.execute(COUNT)
+        self.assertEqual(self.server.ran_in[-1], ("other", COUNT))
+
+    def test_a_setting_is_not_held_hostage_by_the_one_it_replaces(self):
+        # The same rule for the other notes: a `SET` that replaces a setting
+        # is not preceded by the setting it replaces.
+        refused = _f_error("SET SCAN BUDGET is not available")
+        for setting, other in (
+            ("SET SCAN BUDGET ROWS 1", "SET SCAN BUDGET DEFAULT"),
+            ("SET SCAN BUDGET ROWS 1", "SET SCAN BUDGET BYTES 4096"),
+            ("SET CONSISTENCY ALL", "SET CONSISTENCY DEFAULT"),
+        ):
+            with self.subTest(setting=setting, then=other):
+                self.server = Server()
+                self.addCleanup(self.server.close)
+                conn = self.connect(database="app")
+                conn.execute(setting)
+                self.server.always(setting, refused)
+                self.server.restart()
+                with self.assertRaises(skaidb.ProgrammingError) as cm:
+                    conn.execute(COUNT)
+                self.assertIn("is not available", str(cm.exception))
+                conn.execute(other)
+                on_it = [sql for n, sql in self.server.log if n == self.server.connections]
+                self.assertEqual(on_it, ['USE "app"', other])
+                conn.execute(COUNT)
+                self.assertEqual(self.server.ran_in[-1], ("app", COUNT))
 
 
 class Pooled(_Case):
