@@ -13,10 +13,12 @@ from unittest import mock
 import skaidb
 try:
     from test_conformance import V, FakeServer
-    from test_transactions import DROP, Server, _credentials
+    from test_stream import _f_error
+    from test_transactions import DROP, HELLO, STALL, Late, Server, _credentials
 except ImportError:  # run as `python -m unittest tests.test_failover`
     from tests.test_conformance import V, FakeServer
-    from tests.test_transactions import DROP, Server, _credentials
+    from tests.test_stream import _f_error
+    from tests.test_transactions import DROP, HELLO, STALL, Late, Server, _credentials
 
 ROWS_CASE = next(c for c in V["cases"] if c["name"] == "query_rows_several")
 EXCHANGE = (
@@ -28,12 +30,12 @@ SQL = ROWS_CASE["call"]["sql"]
 
 def _connect(servers, **kw):
     # Keep the seed order deterministic: the dying member first.
+    kw.setdefault("timeout", 5)
     with mock.patch.object(skaidb.random, "shuffle", lambda eps: None):
         return skaidb.connect(
             seeds=[f"127.0.0.1:{s.port}" for s in servers],
             user=V["auth"]["username"],
             password=V["auth"]["password"],
-            timeout=5,
             **kw,
         )
 
@@ -159,6 +161,139 @@ class PastThePreparedCache(unittest.TestCase):
         self.assertEqual(self.server.connections, 1, "and nothing was dialed")
         self.assertFalse(self.conn.is_usable())
         self.assertEqual(self.conn.execute("SELECT 1").fetchall(), [(1,)])
+
+
+class UnfinishedHello(unittest.TestCase):
+    """The Hello is a round trip like any other: when its reply does not
+    come, the socket is dead or has an answer still on its way — a
+    connection that looks usable and is not. The dial fails there and moves
+    to the next endpoint. (The Hello is telemetry only in what it carries:
+    an old server's Error to it is still ignored.)"""
+
+    UPDATE = "UPDATE accounts SET balance = 0 WHERE id = 1"
+
+    def member(self, hello=None):
+        server = Server()
+        self.addCleanup(server.close)
+        if hello is not None:
+            server.on(HELLO, hello)
+        return server
+
+    def connect(self, members, **kw):
+        kw.setdefault("timeout", 0.25)
+        conn = _connect(members, **kw)
+        self.addCleanup(conn.close)
+        return conn
+
+    # The reply never comes within the read timeout — or comes late, to be
+    # read as the answer to the first statement — or the member hangs up.
+    FAILURES = [
+        ("no reply", lambda: STALL),
+        ("a late reply", lambda: Late(bytes([skaidb._RESP_DDL]), 0.6)),
+        ("the connection closed", lambda: DROP),
+    ]
+
+    def test_the_dial_moves_to_the_next_endpoint(self):
+        for name, hello in self.FAILURES:
+            for auto in (True, False):
+                with self.subTest(name, auto_reconnect=auto):
+                    failing, healthy = self.member(hello()), self.member()
+                    conn = self.connect([failing, healthy], auto_reconnect=auto)
+                    self.assertEqual(conn._connected, ("127.0.0.1", healthy.port))
+                    self.assertTrue(conn.is_usable())
+                    self.assertEqual(conn.execute(self.UPDATE).rowcount, 1)
+                    self.assertEqual(healthy.statements, [self.UPDATE])
+                    # The member that did not answer was hung up on, and
+                    # never received the statement.
+                    if name != "the connection closed":
+                        self.assertTrue(failing.hung_up(1, within=5), "its socket was left open")
+                    self.assertEqual(failing.statements, [], "the statement went to it as well")
+                    self.assertEqual(healthy.connections, 1)
+
+    def test_with_nowhere_else_to_go_the_connect_fails(self):
+        for name, hello in self.FAILURES:
+            with self.subTest(name):
+                failing = self.member(hello())
+                with self.assertRaises(skaidb.OperationalError) as cm:
+                    self.connect([failing])
+                self.assertIn("could not connect to any endpoint", str(cm.exception))
+                self.assertIn(f"127.0.0.1:{failing.port}: no reply to Hello", str(cm.exception))
+                if name != "the connection closed":
+                    self.assertTrue(failing.hung_up(1, within=5), "its socket was left open")
+
+    def test_a_reconnect_does_the_same(self):
+        first, second = self.member(), self.member()
+        conn = self.connect([first, second])
+        self.assertEqual(conn._connected, ("127.0.0.1", first.port))
+        second.on(HELLO, STALL)  # the member reconnect() tries first
+        conn.reconnect()
+        self.assertEqual(conn._connected, ("127.0.0.1", first.port))
+        self.assertEqual(conn.execute(self.UPDATE).rowcount, 1)
+        self.assertEqual(first.log, [(2, self.UPDATE)])
+        self.assertEqual(second.statements, [])
+
+    def test_a_pool_counts_it_against_the_member_once(self):
+        failing, healthy = self.member(STALL), self.member()
+        with mock.patch.object(skaidb.random, "shuffle", lambda eps: None):
+            pool = skaidb.pool(
+                seeds=[f"127.0.0.1:{failing.port}", f"127.0.0.1:{healthy.port}"],
+                user=V["auth"]["username"], password=V["auth"]["password"], timeout=0.25,
+            )
+            self.addCleanup(pool.close)
+            with pool.connection() as conn:
+                self.assertEqual(conn.execute(self.UPDATE).rowcount, 1)
+        self.assertEqual(healthy.statements, [self.UPDATE])
+        self.assertEqual(pool._members[("127.0.0.1", failing.port)].errors, 1)
+
+    def test_an_old_servers_error_to_hello_is_still_ignored(self):
+        old = self.member(_f_error("protocol error: unknown opcode 8"))
+        conn = self.connect([old])
+        self.assertEqual(conn.execute(self.UPDATE).rowcount, 1)
+        self.assertEqual(old.log, [(1, self.UPDATE)])
+
+
+class SessionLostAtTheDial(unittest.TestCase):
+    """The same for the statements that put the session back on a new
+    connection: a member that fails under them is one more endpoint that
+    did not work, not the end of the dial. An answer is another matter — a
+    database the server says does not exist is an error everywhere."""
+
+    COUNT = "SELECT count(*) FROM notes"
+
+    def members(self):
+        servers = [Server(), Server()]
+        for server in servers:
+            self.addCleanup(server.close)
+        return servers
+
+    def test_a_member_lost_under_the_use_is_not_the_end_of_the_dial(self):
+        failing, healthy = self.members()
+        failing.on('USE "app"', DROP)
+        conn = _connect([failing, healthy], database="app")
+        self.addCleanup(conn.close)
+        self.assertEqual(conn._connected, ("127.0.0.1", healthy.port))
+        conn.execute(self.COUNT)
+        self.assertEqual(healthy.ran_in[-1], ("app", self.COUNT))
+
+    def test_a_member_lost_under_a_setting_is_not_either(self):
+        first, second = self.members()
+        conn = _connect([first, second])
+        self.addCleanup(conn.close)
+        conn.execute("SET SCAN BUDGET ROWS 1")
+        second.on("SET SCAN BUDGET ROWS 1", DROP)  # the member the re-dial tries first
+        first.restart()
+        conn.execute(self.COUNT)
+        self.assertEqual(second.statements, ["SET SCAN BUDGET ROWS 1"])
+        self.assertEqual(first.log[-2:], [(2, "SET SCAN BUDGET ROWS 1"), (2, self.COUNT)])
+        self.assertEqual(first.ran_under[-1], (None, "ROWS 1", self.COUNT))
+
+    def test_a_database_the_server_refuses_ends_it(self):
+        refusing, healthy = self.members()
+        refusing.on('USE "app"', _f_error('database "app" does not exist'))
+        with self.assertRaises(skaidb.ProgrammingError) as cm:
+            _connect([refusing, healthy], database="app")
+        self.assertIn("does not exist", str(cm.exception))
+        self.assertEqual(healthy.connections, 0)
 
 
 if __name__ == "__main__":

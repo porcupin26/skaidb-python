@@ -793,6 +793,9 @@ class Connection:
     def _establish(self) -> None:
         errors = []
         for host, port in self._endpoints:
+            # Once the handshake is through, a failure is one of a round
+            # trip, which reports to the pool itself (`_exchange`).
+            authenticated = False
             try:
                 sock = socket.create_connection(
                     (host, port), timeout=self._connect_timeout
@@ -813,20 +816,25 @@ class Connection:
                     self._handshake_certificate("" if self._user == "anonymous" else self._user)
                 else:
                     self._handshake(self._user, self._password)
+                authenticated = True
+                # Connected + authenticated: a fresh socket has no prepared
+                # statements, no stream in flight and is not broken.
+                self._connected = (host, port)
+                self._broken = False
+                self._streaming = False
+                self._prepared.clear()
+                # The dial is not done until the Hello is answered and the
+                # session is put back. A member that fails under those is
+                # one more endpoint that did not work; what a member
+                # ANSWERS — a database it does not have — ends the dial.
+                self._send_hello()
+                self._restore_session()
             except (OSError, OperationalError) as e:
                 errors.append(f"{host}:{port}: {e}")
                 self._drop_socket()
-                if self._observer is not None and _member_fault(e):
+                if self._observer is not None and not authenticated and _member_fault(e):
                     self._observer._failed((host, port))
                 continue
-            # Connected + authenticated: a fresh socket has no prepared
-            # statements, no stream in flight and is not broken.
-            self._connected = (host, port)
-            self._broken = False
-            self._streaming = False
-            self._prepared.clear()
-            self._send_hello()
-            self._restore_session()
             return
         raise OperationalError("could not connect to any endpoint (" + "; ".join(errors) + ")")
 
@@ -861,20 +869,27 @@ class Connection:
         self._drop_socket()
 
     def _send_hello(self) -> None:
-        """Best-effort self-identification (fills the server's ``drivers``
-        table ``client_name``/``client_version``). An old server rejects the
-        opcode with an error frame, which is ignored — identity is
-        telemetry, never load-bearing."""
+        """Self-identification (fills the server's ``drivers`` table
+        ``client_name``/``client_version``). What the server answers is
+        ignored — an old server rejects the opcode with an error frame, and
+        identity is telemetry, never load-bearing.
+
+        That it answers is not: the Hello is a round trip like any other.
+        A reply that does not come leaves a socket that is dead, or one
+        with an answer still on its way, which the first statement would
+        find — after it was sent, so a retry runs it twice — or read as its
+        own. So a transport failure here is a failed dial
+        (``OperationalError``, the socket closed), and the next endpoint
+        is tried."""
+        name = b"python"
+        ver = __version__.encode()
+        req = bytearray([_OP_HELLO])
+        req += struct.pack("<I", len(name)) + name
+        req += struct.pack("<I", len(ver)) + ver
         try:
-            name = b"python"
-            ver = __version__.encode()
-            req = bytearray([_OP_HELLO])
-            req += struct.pack("<I", len(name)) + name
-            req += struct.pack("<I", len(ver)) + ver
-            self._write_frame(bytes(req))
-            self._read_frame()  # Ddl ack, or an old server's Error — either way, done.
-        except (OSError, OperationalError):
-            pass
+            self._exchange(bytes(req))  # Ddl ack, or an old server's Error — either way, done.
+        except OperationalError as e:
+            raise OperationalError(f"no reply to Hello ({e})") from e
 
     def _restore_session(self) -> None:
         """Put the state of the session back on a connection just dialed,

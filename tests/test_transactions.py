@@ -81,6 +81,8 @@ class Then:
 HALF_CLOSE = object()
 CLOSE_NOTIFY = object()
 RESET = object()
+# Scripted in place of a statement's text: the Hello a connection opens with.
+HELLO = ("hello",)
 
 
 def _rows(columns, rows) -> bytes:
@@ -121,6 +123,8 @@ class Server:
     connection does not hold is refused and noted in `unknown_ids`.
 
     `on(sql, *replies)` scripts the answers to the next executions of `sql`
+    (or, for `HELLO`, to the next connections' Hello, which is otherwise
+    acknowledged and not recorded)
     and `always(sql, reply)` the answer to every later one; a reply is a
     payload, a list of payloads (the frames of a stream), `DROP`, `STALL`, a
     `Late` one of those, or a `Then` (a reply, and what the server does to
@@ -278,10 +282,14 @@ class Server:
                 prepared.pop(struct.unpack_from("<I", req, 1)[0], None)
                 with self._lock:
                     self._prepared_open[number] = len(prepared)
-            if op in (skaidb._OP_CLOSE, skaidb._OP_HELLO):
+            if op == skaidb._OP_CLOSE:
                 _send(conn, _DDL)
                 continue
-            if op == skaidb._OP_PREPARE:
+            if op == skaidb._OP_HELLO:
+                reply = self._scripted(HELLO)
+                if reply is None:
+                    reply = _DDL
+            elif op == skaidb._OP_PREPARE:
                 sql = self._sql(req, 1)
                 reply = self._scripted(("prepare", sql))
                 if reply is None and self._session_control(_without_comments(sql)):
