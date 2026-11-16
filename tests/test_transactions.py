@@ -11,9 +11,14 @@ helper retries on exactly that prefix.
 
 import hashlib
 import hmac
+import os
 import re
+import shutil
 import socket
+import ssl
 import struct
+import subprocess
+import tempfile
 import threading
 import time
 import unittest
@@ -54,6 +59,29 @@ class Late:
         self.delay = delay
 
 
+class Then:
+    """Scripted in place of a reply: `reply`, and then the server does
+    `what` to the connection, which the client is about to leave idle:
+
+    * `HALF_CLOSE` — shuts down its sending side only, and keeps reading
+      and discarding whatever still arrives (`Server.discarded`). The client
+      reads EOF, and its writes succeed: a closed connection as it looks
+      over a real network, where the reset for a write comes back too late
+      to fail it;
+    * `CLOSE_NOTIFY` — the same, announced with TLS's own alert;
+    * `RESET` — closes with a reset (`SO_LINGER` 0);
+    * a payload — sends it as one more frame nobody asked for."""
+
+    def __init__(self, reply, what):
+        self.reply = reply
+        self.what = what
+
+
+HALF_CLOSE = object()
+CLOSE_NOTIFY = object()
+RESET = object()
+
+
 def _rows(columns, rows) -> bytes:
     """A Rows frame: the columns, then the rows (as a stream's header and
     chunk lay them out)."""
@@ -78,6 +106,9 @@ class Server:
     CONSISTENCY` and the limits of the last `SET SCAN BUDGET` answered with
     success, None for one never set or cleared with `DEFAULT`.
     `restart()` closes every open connection, as a restarting server does.
+    `discarded(n)` is what connection `n` received after the server
+    half-closed it (`Then`). With `tls=True` every connection is wrapped in
+    TLS, under a certificate made for the run.
 
     Each connection has the real server's prepared-statement table: at most
     `MAX_PREPARED` statements, a slot freed by the close opcode, a prepare
@@ -90,8 +121,9 @@ class Server:
 
     `on(sql, *replies)` scripts the answers to the next executions of `sql`
     and `always(sql, reply)` the answer to every later one; a reply is a
-    payload, a list of payloads (the frames of a stream), `DROP`, `STALL` or
-    a `Late` one of those.
+    payload, a list of payloads (the frames of a stream), `DROP`, `STALL`, a
+    `Late` one of those, or a `Then` (a reply, and what the server does to
+    the connection after it).
     Unscripted, `BEGIN …` / `COMMIT` / `ROLLBACK` / `USE …` / `SET …` are
     acknowledged, a `SELECT` answers one row and anything else is a one-row
     mutation."""
@@ -99,7 +131,9 @@ class Server:
     MAX_PREPARED = 256
     TABLE_FULL = "too many prepared statements (max 256); close some first"
 
-    def __init__(self):
+    def __init__(self, tls=False):
+        self._tls = _server_tls() if tls else None
+        self._discarded = {}
         self.log = []
         self.ran_in = []
         self.ran_under = []
@@ -154,13 +188,21 @@ class Server:
         with self._lock:
             return self._prepared_open.get(number, 0)
 
+    def discarded(self, number) -> bytes:
+        """The bytes the client sent on connection `number` after the server
+        half-closed it."""
+        with self._lock:
+            return bytes(self._discarded.get(number, b""))
+
     def restart(self):
         """Close every connection accepted so far; the listener stays."""
         with self._lock:
             gone, self._open = self._open, []
         for conn in gone:
             try:
-                conn.shutdown(socket.SHUT_RDWR)
+                # The transport's own shutdown, also under TLS: the thread
+                # serving the connection is reading from it.
+                socket.socket.shutdown(conn, socket.SHUT_RDWR)
             except OSError:
                 pass
 
@@ -182,6 +224,10 @@ class Server:
 
     def _serve_safe(self, conn, number):
         try:
+            if self._tls is not None:
+                conn = self._tls.wrap_socket(conn, server_side=True)
+                with self._lock:
+                    self._open.append(conn)
             with conn:
                 if self._handshake(conn):
                     self._serve(conn, number)
@@ -283,12 +329,52 @@ class Server:
             if isinstance(reply, Late):
                 time.sleep(reply.delay)
                 reply = reply.reply
+            then = None
+            if isinstance(reply, Then):
+                reply, then = reply.reply, reply.what
             if reply is DROP:
                 return
             if reply is STALL:
                 continue
             for payload in reply if isinstance(reply, list) else [reply]:
                 _send(conn, payload)
+            if then is RESET:
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                return  # closed on the way out: a reset, not a FIN
+            if then is HALF_CLOSE or then is CLOSE_NOTIFY:
+                self._half_close(conn, number, notify=then is CLOSE_NOTIFY)
+                return
+            if then is not None:
+                _send(conn, then)
+
+    def _half_close(self, conn, number, notify):
+        """Stop sending on `conn` — with TLS's close alert first, if
+        `notify` — and read on, discarding and counting what arrives, until
+        the client closes."""
+        with self._lock:
+            self._discarded[number] = bytearray()
+        if notify:
+            conn.settimeout(0)
+            try:
+                conn.unwrap()  # sends the alert; the client's is not waited for
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                pass
+            conn.settimeout(None)
+        # The transport's own shutdown: under TLS the session stays up for
+        # reading, so what is counted is what the client sent to be read —
+        # not the alert a TLS library may answer the close with.
+        socket.socket.shutdown(conn, socket.SHUT_WR)
+        try:
+            while True:
+                data = conn.recv(65536)
+                if not data:
+                    break
+                with self._lock:
+                    self._discarded[number] += data
+        except ssl.SSLError:  # the client's TLS ended the session
+            pass
+        with self._lock:
+            self._hung_up.add(number)
 
     @staticmethod
     def _params(req) -> list:
@@ -353,14 +439,43 @@ def _without_comments(sql) -> str:
     )
 
 
+_TLS = []
+
+
+def _server_tls() -> ssl.SSLContext:
+    """A server-side TLS context under a self-signed certificate, made once
+    per run with the `openssl` command (as tests/test_certificate_auth.py
+    makes its own)."""
+    if not _TLS:
+        if shutil.which("openssl") is None:
+            raise unittest.SkipTest("needs the openssl command to make a certificate")
+        d = tempfile.mkdtemp()
+        key, crt = os.path.join(d, "k.pem"), os.path.join(d, "c.pem")
+        try:
+            subprocess.run(
+                ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key,
+                 "-out", crt, "-days", "1", "-subj", "/CN=skaidb"],
+                check=True, capture_output=True,
+            )
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(crt, key)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        _TLS.append(ctx)
+    return _TLS[0]
+
+
 def _credentials(server):
-    return dict(
+    kw = dict(
         host="127.0.0.1",
         port=server.port,
         user=V["auth"]["username"],
         password=V["auth"]["password"],
         timeout=5,
     )
+    if server._tls is not None:
+        kw["tls_insecure"] = True
+    return kw
 
 
 class _Case(unittest.TestCase):

@@ -28,6 +28,7 @@ import hashlib
 import hmac
 import logging
 import random
+import select
 import socket
 import ssl
 import struct
@@ -590,6 +591,19 @@ def _session_statement(sql: str) -> "tuple[str, str | None] | None":
     return (kind, None if level == ["DEFAULT"] else text)
 
 
+# ---- A look at an idle socket ------------------------------------------------
+
+
+def _readable(sock) -> bool:
+    """Whether a read on `sock` would return at once — data, the peer's
+    close or an error — asked of the operating system without waiting."""
+    if hasattr(select, "poll"):  # no limit on the descriptor's number
+        poller = select.poll()
+        poller.register(sock, select.POLLIN)
+        return bool(poller.poll(0))
+    return bool(select.select([sock], [], [], 0)[0])
+
+
 # ---- SCRAM-SHA-256 handshake (§2) -----------------------------------------
 
 
@@ -898,13 +912,85 @@ class Connection:
     def is_usable(self) -> bool:
         """True if the connection can be handed to a new caller — not closed,
         not left out of sync by a transport error or an undrainable abandoned
-        stream, and not currently mid-stream. Cheap (no round-trip).
+        stream, not currently mid-stream, and not closed by its peer while
+        it sat idle (`_gone`; a connection found so is marked broken).
+        Cheap (no round-trip).
 
         The mid-stream case matters because this doubles as a pool's health
         check: a connection returned to the pool while a `RowStream` is still
         live has chunks in flight, and the next caller would read them as the
         answer to its own statement."""
-        return not self.closed and not self._broken and not self._streaming
+        if self.closed or self._broken or self._streaming:
+            return False
+        # Only an idle socket can be looked at: with a round trip in flight
+        # (another thread holds the lock) a reply is what is readable.
+        lock = getattr(self, "_lock", None)
+        if lock is None or not lock.acquire(False):
+            return True
+        try:
+            gone = not self._broken and not self._streaming and self._gone()
+            if gone:
+                self._mark_broken()
+        finally:
+            lock.release()
+        if gone:
+            self._observe_failure()
+        return not gone
+
+    def _look(self) -> None:
+        """Before a statement's first request: if the peer closed the
+        connection while it sat idle, mark it broken now, with nothing
+        sent. A member's restart, a failover or an idle timeout closes idle
+        connections, and over a real network the write to such a socket
+        still succeeds — the reset has not come back yet — so only the read
+        fails, after the statement left: one that may not be sent again
+        then fails, and one that is sent again may run twice. Found here,
+        the connection is replaced exactly as after a failed write, before
+        anything is written."""
+        with self._lock:
+            if self.closed or self._broken or self._streaming:
+                return
+            if not self._gone():
+                return
+            self._mark_broken()
+        self._observe_failure()
+
+    def _gone(self) -> bool:
+        """Whether the socket of this idle connection is dead: one readiness
+        poll that does not wait, and no round trip. The server sends nothing
+        on an idle connection, so a socket that is readable holds its close,
+        a reset, or bytes nobody asked for — after any of them it cannot
+        carry a request.
+
+        Under TLS the socket polled is the transport's, and TLS has records
+        of its own (a session ticket, a key update): a read that does not
+        wait tells them, which it consumes, from a close or stray data.
+        Bytes already decrypted and not read count as stray too."""
+        sock = self._sock
+        if sock is None or not hasattr(sock, "fileno"):
+            return False  # no socket of the operating system's to look at
+        tls = isinstance(sock, ssl.SSLSocket)
+        try:
+            if tls and sock.pending() > 0:
+                return True
+            if not _readable(sock):
+                return False
+            timeout = sock.gettimeout()
+            sock.settimeout(0)  # the read below must not wait either
+            try:
+                if tls:
+                    sock.recv(1)  # b"": the peer closed; a byte: stray data
+                else:
+                    sock.recv(1, socket.MSG_PEEK)
+                return True
+            except (BlockingIOError, ssl.SSLWantReadError, ssl.SSLWantWriteError):
+                # Nothing for this connection after all: a spurious wake-up,
+                # or records TLS keeps to itself.
+                return False
+            finally:
+                sock.settimeout(timeout)
+        except (OSError, ValueError):  # reset, or closed under us
+            return True
 
     def ping(self) -> bool:
         """Round-trip liveness check; returns False (and marks the connection
@@ -943,6 +1029,10 @@ class Connection:
         """The span of one statement of the application, from before its
         first request to its answer.
 
+        It starts with a look at the socket (`_look`): a connection that
+        died while it sat idle is replaced before the statement is written,
+        not after it failed.
+
         A statement that sets part of the session's state itself — a `USE`,
         a `SET CONSISTENCY`, a `SET SCAN BUDGET` — says so for the dials
         made on its behalf, which then leave that part alone
@@ -955,6 +1045,7 @@ class Connection:
         noted = _session_statement(sql)
         outer, self._stating = self._stating, noted[0] if noted else None
         try:
+            self._look()
             yield
         except BaseException:
             if self._unrestored:
@@ -2389,6 +2480,9 @@ class ConnectionPool:
     def putconn(self, conn: Connection) -> None:
         """Return a connection to the pool, or close it if it is broken, its
         member is ejected or gone, or the pool is full."""
+        # Asked before the pool's lock is taken: the answer looks at the
+        # socket, and a connection found dead reports to the pool.
+        usable = conn.is_usable()
         with self._lock:
             m = self._members.get(conn._pool_ep)
             if getattr(conn, "_pool_out", False):
@@ -2397,7 +2491,7 @@ class ConnectionPool:
                     m.in_use -= 1
             if (
                 not self.closed
-                and conn.is_usable()
+                and usable
                 and m is not None
                 and self._usable(m)
                 and len(self._idle) < self._maxsize
